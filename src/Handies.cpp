@@ -33,7 +33,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -297,34 +296,93 @@ RpAtomic* collect_atomic(RpAtomic* atomic, void* data) noexcept {
 
 [[nodiscard]] RpGeometry* clone_geometry(const RpGeometry* source) {
     if (source == nullptr) return nullptr;
-    const RwUInt32 size{RpGeometryStreamGetSize(source)};
-    if (size == 0 || size > std::numeric_limits<RwUInt32>::max() - 64U) {
+    const RwInt32 vertex_count{RpGeometryGetNumVertices(source)};
+    const RwInt32 triangle_count{RpGeometryGetNumTriangles(source)};
+    const RwInt32 morph_count{RpGeometryGetNumMorphTargets(source)};
+    const RwInt32 texcoord_count{RpGeometryGetNumTexCoordSets(source)};
+    if (vertex_count <= 0 || triangle_count <= 0 || morph_count <= 0 ||
+        texcoord_count < 0 || texcoord_count > rwMAXTEXTURECOORDS) {
         return nullptr;
     }
-    std::vector<RwUInt8> buffer(static_cast<std::size_t>(size) + 64U);
-    RwMemory memory{buffer.data(), static_cast<RwUInt32>(buffer.size())};
-    RwStream* stream{RwStreamOpen(rwSTREAMMEMORY, rwSTREAMWRITE, &memory)};
-    if (stream == nullptr) return nullptr;
-    const bool written{RpGeometryStreamWrite(source, stream) != nullptr};
-    RwStreamClose(stream, nullptr);
-    if (!written) return nullptr;
-    stream = RwStreamOpen(rwSTREAMMEMORY, rwSTREAMREAD, &memory);
-    if (stream == nullptr) return nullptr;
-    RpGeometry* clone{};
-    if (RwStreamFindChunk(stream, rwID_GEOMETRY, nullptr, nullptr)) {
-        clone = RpGeometryStreamRead(stream);
+    const RwUInt32 format{
+        (RpGeometryGetFlags(source) & rpGEOMETRYFLAGSMASK) |
+        rpGEOMETRYTEXCOORDSETS(static_cast<RwUInt32>(texcoord_count))};
+    RpGeometry* clone{RpGeometryCreate(vertex_count, triangle_count, format)};
+    if (clone == nullptr) return nullptr;
+    if (morph_count > 1 &&
+        RpGeometryAddMorphTargets(clone, morph_count - 1) < 0) {
+        RpGeometryDestroy(clone);
+        return nullptr;
     }
-    RwStreamClose(stream, nullptr);
-    if (clone != nullptr &&
-        RpGeometryGetNumMaterials(clone) == RpGeometryGetNumMaterials(source)) {
-        // Geometry streaming resolves texture names through the current TXD.
-        // At ped-render time that dictionary is not guaranteed to be the
-        // model's TXD, so retain the already resolved original texture refs.
-        for (RwInt32 index{}; index < RpGeometryGetNumMaterials(source); ++index) {
-            RpMaterialSetTexture(
-                RpGeometryGetMaterial(clone, index),
-                RpMaterialGetTexture(RpGeometryGetMaterial(source, index)));
+
+    for (RwInt32 morph_index{}; morph_index < morph_count; ++morph_index) {
+        const RpMorphTarget* source_morph{
+            RpGeometryGetMorphTarget(source, morph_index)};
+        RpMorphTarget* target_morph{RpGeometryGetMorphTarget(clone, morph_index)};
+        const RwV3d* source_vertices{RpMorphTargetGetVertices(source_morph)};
+        RwV3d* target_vertices{RpMorphTargetGetVertices(target_morph)};
+        if (source_vertices == nullptr || target_vertices == nullptr) {
+            RpGeometryDestroy(clone);
+            return nullptr;
         }
+        std::memcpy(target_vertices, source_vertices,
+                    sizeof(RwV3d) * static_cast<std::size_t>(vertex_count));
+        RpMorphTargetSetBoundingSphere(
+            target_morph, RpMorphTargetGetBoundingSphere(source_morph));
+
+        const RwV3d* source_normals{RpMorphTargetGetVertexNormals(source_morph)};
+        RwV3d* target_normals{RpMorphTargetGetVertexNormals(target_morph)};
+        if (source_normals != nullptr && target_normals != nullptr) {
+            std::memcpy(target_normals, source_normals,
+                        sizeof(RwV3d) * static_cast<std::size_t>(vertex_count));
+        }
+    }
+
+    const RwRGBA* source_colors{RpGeometryGetPreLightColors(source)};
+    RwRGBA* target_colors{RpGeometryGetPreLightColors(clone)};
+    if (source_colors != nullptr && target_colors != nullptr) {
+        std::memcpy(target_colors, source_colors,
+                    sizeof(RwRGBA) * static_cast<std::size_t>(vertex_count));
+    }
+    for (RwInt32 uv_index{}; uv_index < texcoord_count; ++uv_index) {
+        const auto coordinate_index{
+            static_cast<RwTextureCoordinateIndex>(uv_index)};
+        const RwTexCoords* source_uvs{
+            RpGeometryGetVertexTexCoords(source, coordinate_index)};
+        RwTexCoords* target_uvs{
+            RpGeometryGetVertexTexCoords(clone, coordinate_index)};
+        if (source_uvs == nullptr || target_uvs == nullptr) {
+            RpGeometryDestroy(clone);
+            return nullptr;
+        }
+        std::memcpy(target_uvs, source_uvs,
+                    sizeof(RwTexCoords) * static_cast<std::size_t>(vertex_count));
+    }
+
+    const RpTriangle* source_triangles{RpGeometryGetTriangles(source)};
+    RpTriangle* target_triangles{RpGeometryGetTriangles(clone)};
+    if (source_triangles == nullptr || target_triangles == nullptr) {
+        RpGeometryDestroy(clone);
+        return nullptr;
+    }
+    for (RwInt32 triangle_index{}; triangle_index < triangle_count;
+         ++triangle_index) {
+        const RpTriangle& source_triangle{source_triangles[triangle_index]};
+        RpTriangle& target_triangle{target_triangles[triangle_index]};
+        RpGeometryTriangleSetVertexIndices(
+            clone, &target_triangle, source_triangle.vertIndex[0],
+            source_triangle.vertIndex[1], source_triangle.vertIndex[2]);
+        RpMaterial* material{
+            RpGeometryTriangleGetMaterial(source, &source_triangle)};
+        if (material == nullptr ||
+            RpGeometryTriangleSetMaterial(clone, &target_triangle, material) == nullptr) {
+            RpGeometryDestroy(clone);
+            return nullptr;
+        }
+    }
+    if (RpGeometryUnlock(clone) == nullptr) {
+        RpGeometryDestroy(clone);
+        return nullptr;
     }
     return clone;
 }
