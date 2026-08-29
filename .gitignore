@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# DragonFF is an external dependency.
+DragonFF/
+DragonFF-master/
+
+# Never publish extracted game assets or generated output.
+*.dff
+*.txd
+*.img
+con manos/
+output/
