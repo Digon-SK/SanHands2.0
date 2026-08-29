@@ -13,7 +13,8 @@ The generated DFFs contain the replacement hand geometry, closed wrist seams, co
 - Keeps GTA's normal walk, fight, weapon, gesture, and body animation associations at 32 frames.
 - Creates a private geometry and a 58-node render hierarchy only after GTA has initialized a ped normally.
 - Appends 13 runtime-only finger nodes per hand without shifting any native node.
-- Evaluates relaxed, grip/fist, and `FUCKU` finger poses after the native animation update.
+- Evaluates relaxed, grip/fist, `FUCKU`, and the ten original gang-sign finger tracks after the native animation update.
+- Uses the active native hand-signal task's animation ID and playback time, while suppressing only its separate replacement-hand render pass.
 - Copies TXD files byte-for-byte.
 
 `player.dff` is copied unchanged because CJ uses a modular body assembled from `player.img` rather than a conventional pedestrian mesh.
@@ -44,6 +45,7 @@ The defaults use:
 - MinGW 32-bit: `C:\msys64\mingw32`
 - plugin-sdk: `C:\Users\Digon\Documents\Fuentes\plugin-sdk-master`
 - pose source: `C:\Users\Digon\Documents\ChatGPT\SanHands\dist\handpose.ifp`
+- original gang-sign source: `C:\Users\Digon\Documents\ChatGPT\SanHands\build\source_ghands.ifp`
 - Original peds: `C:\Users\Digon\Desktop\peds`
 - Native articulated hands: `C:\Users\Digon\Desktop\hands`
 - Final models: `C:\Users\Digon\Desktop\peds\con manos`

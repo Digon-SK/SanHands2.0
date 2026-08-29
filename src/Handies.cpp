@@ -10,9 +10,12 @@
 #include "plugin.h"
 
 #include "AnimBlendFrameData.h"
+#include "CAnimBlendAssociation.h"
 #include "CAnimBlendClumpData.h"
+#include "CHandObject.h"
 #include "CPed.h"
 #include "CPedIntelligence.h"
+#include "CTask.h"
 #include "CTaskManager.h"
 #include "CTimer.h"
 #include "CWeapon.h"
@@ -21,6 +24,7 @@
 #include "eAnimations.h"
 #include "ePedState.h"
 #include "eTaskType.h"
+#include "calling.hpp"
 
 #include <Windows.h>
 
@@ -46,6 +50,7 @@ constexpr int native_bone_count{32};
 constexpr int runtime_bone_count{58};
 constexpr int finger_bones_per_hand{15};
 constexpr int pose_count{3};
+constexpr int hand_signal_count{5};
 constexpr int left_hand_id{34};
 constexpr int right_hand_id{24};
 constexpr int left_extra_id_base{1005};
@@ -54,8 +59,13 @@ constexpr char data_file_name[]{"Handies.dat"};
 constexpr char ini_file_name[]{"Handies.ini"};
 constexpr char log_file_name[]{"Handies.log"};
 constexpr std::array<char, 8> data_magic{'H', 'N', 'D', '2', 'D', 'A', 'T', '\0'};
-constexpr std::uint32_t data_version{1};
+constexpr std::uint32_t data_version{2};
 constexpr float minimum_visible_animation_blend{0.01F};
+constexpr std::uintptr_t hand_object_vtable_address{0x866EE0};
+constexpr std::uintptr_t hand_object_pre_render_slot{
+    hand_object_vtable_address + 17U * sizeof(std::uintptr_t)};
+constexpr std::uintptr_t hand_object_render_slot{
+    hand_object_vtable_address + 18U * sizeof(std::uintptr_t)};
 
 struct Settings {
     bool enabled{true};
@@ -77,6 +87,53 @@ struct RuntimeProfile {
 using PoseTable = std::array<
     std::array<std::array<RtQuat, finger_bones_per_hand>, pose_count>,
     2>;
+
+struct FingerKey {
+    float time{};
+    RtQuat rotation{};
+};
+
+struct FingerTrack {
+    std::vector<FingerKey> keys{};
+};
+
+struct HandSignalAnimation {
+    float duration{};
+    std::array<FingerTrack, finger_bones_per_hand> tracks{};
+};
+
+using HandSignalTable = std::array<
+    std::array<HandSignalAnimation, hand_signal_count>,
+    2>;
+
+struct HandSignalState {
+    int animation_index{-1};
+    float time{};
+    bool left{};
+    bool right{};
+};
+
+// ABI view of CTaskSimplePlayHandSignalAnim in GTA SA 1.0 US. Keeping this
+// private avoids constructing or replacing the native task; Handies only reads
+// the association, selected hand animation, and side information it owns.
+struct NativeHandSignalTaskView {
+    void* vtable{};
+    CTask* parent{};
+    CAnimBlendAssociation* body_animation{};
+    std::uint8_t flags{};
+    std::array<std::byte, 3> first_padding{};
+    std::int32_t hand_animation_id{};
+    float blend_delta{};
+    std::uint8_t use_fat_hands{};
+    std::array<std::byte, 3> second_padding{};
+    CHandObject* left_hand{};
+    CHandObject* right_hand{};
+};
+
+static_assert(sizeof(NativeHandSignalTaskView) == 0x24);
+static_assert(offsetof(NativeHandSignalTaskView, body_animation) == 0x08);
+static_assert(offsetof(NativeHandSignalTaskView, hand_animation_id) == 0x10);
+static_assert(offsetof(NativeHandSignalTaskView, right_hand) == 0x20);
 
 struct RuntimeBinding {
     RpHAnimHierarchy* hierarchy{};
@@ -209,6 +266,38 @@ private:
            association->m_fBlendAmount > minimum_visible_animation_blend;
 }
 
+[[nodiscard]] HandSignalState read_hand_signal_state(CPed& ped) noexcept {
+    HandSignalState result{};
+    if (ped.m_pIntelligence == nullptr) return result;
+
+    CTask* const task{ped.m_pIntelligence->m_TaskMgr.FindTaskByType(
+        TASK_SECONDARY_PARTIAL_ANIM, TASK_SIMPLE_HANDSIGNAL_ANIM)};
+    if (task == nullptr) return result;
+
+    const auto* const signal{
+        reinterpret_cast<const NativeHandSignalTaskView*>(task)};
+    CAnimBlendAssociation* const association{signal->body_animation};
+    const int animation_index{
+        signal->hand_animation_id - static_cast<int>(ANIM_HANDSIGNAL_GSIGN1)};
+    if (association == nullptr || animation_index < 0 ||
+        animation_index >= hand_signal_count ||
+        association->m_fBlendAmount <= minimum_visible_animation_blend) {
+        return result;
+    }
+
+    const unsigned short group{association->m_nAnimGroup};
+    if (group != static_cast<unsigned short>(ANIM_GROUP_HANDSIGNAL) &&
+        group != static_cast<unsigned short>(ANIM_GROUP_HANDSIGNALL)) {
+        return result;
+    }
+
+    result.animation_index = animation_index;
+    result.time = std::max(association->m_fCurrentTime, 0.0F);
+    result.left = true;
+    result.right = group == static_cast<unsigned short>(ANIM_GROUP_HANDSIGNAL);
+    return result;
+}
+
 [[nodiscard]] RtQuat normalized_lerp(
     const RtQuat& first,
     RtQuat second,
@@ -241,6 +330,29 @@ private:
     result.imag.z *= inverse_length;
     result.real *= inverse_length;
     return result;
+}
+
+[[nodiscard]] RtQuat sample_track(
+    const FingerTrack& track,
+    float time) noexcept {
+    if (track.keys.empty()) {
+        RtQuat identity{};
+        identity.real = 1.0F;
+        return identity;
+    }
+    if (time <= track.keys.front().time) return track.keys.front().rotation;
+    if (time >= track.keys.back().time) return track.keys.back().rotation;
+    for (std::size_t index{1}; index < track.keys.size(); ++index) {
+        const FingerKey& second{track.keys[index]};
+        if (time > second.time) continue;
+        const FingerKey& first{track.keys[index - 1]};
+        const float span{second.time - first.time};
+        const float amount{span > 1.0e-6F
+            ? std::clamp((time - first.time) / span, 0.0F, 1.0F)
+            : 0.0F};
+        return normalized_lerp(first.rotation, second.rotation, amount);
+    }
+    return track.keys.back().rotation;
 }
 
 [[nodiscard]] int target_bone_id(int side, int source_id) noexcept {
@@ -397,6 +509,7 @@ public:
         load_settings();
         const bool data_loaded{load_runtime_data()};
         install_update_hook();
+        if (data_loaded) install_hand_object_hooks();
         log(data_loaded
                 ? "Handies activo: esqueleto nativo y dedos agregados en memoria."
                 : "ERROR: Handies.dat no pudo cargarse; el mod queda inactivo.");
@@ -406,6 +519,8 @@ public:
             load_settings();
             if (profiles_.empty() && !load_runtime_data()) {
                 log("ERROR: Handies.dat sigue sin estar disponible al iniciar partida.");
+            } else {
+                install_hand_object_hooks();
             }
         };
         plugin::Events::gameProcessEvent += [this] { on_game_process(); };
@@ -510,6 +625,43 @@ private:
                     }
                 }
             }
+            HandSignalTable hand_signals{};
+            for (auto& side : hand_signals) {
+                for (auto& animation : side) {
+                    if (!reader.read(animation.duration) ||
+                        !std::isfinite(animation.duration) ||
+                        animation.duration <= 0.0F || animation.duration > 30.0F) {
+                        return false;
+                    }
+                    for (auto& track : animation.tracks) {
+                        std::uint32_t key_count{};
+                        if (!reader.read(key_count) || key_count == 0 || key_count > 64) {
+                            return false;
+                        }
+                        track.keys.resize(key_count);
+                        float previous_time{-1.0F};
+                        for (auto& key : track.keys) {
+                            std::array<float, 4> packed{};
+                            if (!reader.read(key.time) || !reader.read(packed) ||
+                                !std::isfinite(key.time) || key.time < previous_time ||
+                                key.time < 0.0F ||
+                                key.time > animation.duration + 1.0e-4F) {
+                                return false;
+                            }
+                            key.rotation.imag = {packed[0], packed[1], packed[2]};
+                            key.rotation.real = packed[3];
+                            const float length_squared{
+                                packed[0] * packed[0] + packed[1] * packed[1] +
+                                packed[2] * packed[2] + packed[3] * packed[3]};
+                            if (!std::isfinite(length_squared) ||
+                                std::abs(length_squared - 1.0F) > 0.01F) {
+                                return false;
+                            }
+                            previous_time = key.time;
+                        }
+                    }
+                }
+            }
             std::vector<RuntimeProfile> profiles{};
             profiles.reserve(profile_count);
             for (std::uint32_t profile_index{}; profile_index < profile_count;
@@ -554,6 +706,7 @@ private:
             }
             if (reader.remaining() != 0) return false;
             poses_ = poses;
+            hand_signals_ = std::move(hand_signals);
             profiles_ = std::move(profiles);
             return true;
         } catch (...) {
@@ -571,6 +724,78 @@ private:
         log(original_update_animations_ != nullptr
                 ? "Hook nativo de actualización instalado."
                 : "ERROR: no se pudo instalar el hook de actualización.");
+    }
+
+    void install_hand_object_hooks() noexcept {
+        if (hand_object_hooks_installed_) return;
+
+        const auto pre_render_address{
+            injector::ReadMemory<std::uintptr_t>(hand_object_pre_render_slot, true)};
+        const auto render_address{
+            injector::ReadMemory<std::uintptr_t>(hand_object_render_slot, true)};
+        if (pre_render_address == 0 || render_address == 0) {
+            log("ERROR: no se encontraron los métodos nativos de CHandObject.");
+            return;
+        }
+
+        original_hand_pre_render_ = pre_render_address;
+        original_hand_render_ = render_address;
+        injector::WriteMemory<std::uintptr_t>(
+            hand_object_pre_render_slot,
+            reinterpret_cast<std::uintptr_t>(&hand_object_pre_render_hook), true);
+        injector::WriteMemory<std::uintptr_t>(
+            hand_object_render_slot,
+            reinterpret_cast<std::uintptr_t>(&hand_object_render_hook), true);
+        hand_object_hooks_installed_ = true;
+        log("Manos externas nativas anuladas; las señales deforman la geometría del ped.");
+    }
+
+    [[nodiscard]] bool should_suppress_native_hand(
+        const CHandObject* hand) const noexcept {
+        if (!settings_.enabled || hand == nullptr || hand->m_pPed == nullptr ||
+            hand->m_pPed->m_pRwClump == nullptr || profiles_.empty()) {
+            return false;
+        }
+        CPed* const ped{hand->m_pPed};
+        const bool is_player{ped == FindPlayerPed()};
+        if ((is_player && !settings_.enable_player) ||
+            (!is_player && !settings_.enable_npcs)) {
+            return false;
+        }
+        AtomicList atomics{};
+        RpClumpForAllAtomics(ped->m_pRwClump, collect_atomic, &atomics);
+        if (atomics.overflow) return false;
+        for (std::size_t index{}; index < atomics.size; ++index) {
+            if (find_profile(RpAtomicGetGeometry(atomics.values[index])) != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void __fastcall hand_object_pre_render_hook(
+        CHandObject* hand,
+        void*) noexcept {
+        if (instance_ != nullptr && instance_->should_suppress_native_hand(hand)) {
+            hand->bIsVisible = false;
+            hand->m_nObjectFlags.bDoNotRender = true;
+            return;
+        }
+        if (original_hand_pre_render_ != 0) {
+            injector::thiscall<void(CHandObject*)>::call(
+                original_hand_pre_render_, hand);
+        }
+    }
+
+    static void __fastcall hand_object_render_hook(
+        CHandObject* hand,
+        void*) noexcept {
+        if (instance_ != nullptr && instance_->should_suppress_native_hand(hand)) {
+            return;
+        }
+        if (original_hand_render_ != 0) {
+            injector::thiscall<void(CHandObject*)>::call(original_hand_render_, hand);
+        }
     }
 
     static void __cdecl update_animations_hook(
@@ -858,6 +1083,9 @@ private:
     }
 
     void apply_finger_matrices(PedEntry& entry) const noexcept {
+        const HandSignalState signal{entry.ped != nullptr
+            ? read_hand_signal_state(*entry.ped)
+            : HandSignalState{}};
         for (std::size_t binding_index{};
              binding_index < entry.binding_count;
              ++binding_index) {
@@ -894,6 +1122,18 @@ private:
                             rotation, poses_[side][2][finger_index],
                             smoothstep(entry.fucku_blend));
                     }
+                    const bool signal_active{
+                        signal.animation_index >= 0 &&
+                        ((side == 0 && signal.left) ||
+                         (side == 1 && signal.right))};
+                    if (signal_active) {
+                        const HandSignalAnimation& animation{
+                            hand_signals_[side][static_cast<std::size_t>(
+                                signal.animation_index)]};
+                        rotation = sample_track(
+                            animation.tracks[finger_index],
+                            std::min(signal.time, animation.duration));
+                    }
                     RwMatrix local{};
                     RtQuatConvertToMatrix(&rotation, &local);
                     local.pos = binding.profile->translations[
@@ -918,6 +1158,7 @@ private:
 
     Settings settings_{};
     PoseTable poses_{};
+    HandSignalTable hand_signals_{};
     std::vector<RuntimeProfile> profiles_{};
     std::array<PedEntry, max_tracked_peds> entries_{};
     std::array<char, MAX_PATH> ini_path_{};
@@ -927,6 +1168,9 @@ private:
     inline static HandiesMod* instance_{};
     inline static UpdateAnimationsFunction original_update_animations_{
         reinterpret_cast<UpdateAnimationsFunction>(0x4D34F0)};
+    inline static std::uintptr_t original_hand_pre_render_{0x59ECD0};
+    inline static std::uintptr_t original_hand_render_{0x59EE80};
+    bool hand_object_hooks_installed_{};
 };
 
 HandiesMod handies_mod{};

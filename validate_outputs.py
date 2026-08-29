@@ -205,9 +205,30 @@ try:
     if len(data) < 16 or data[:8] != b"HND2DAT\0":
         raise ValueError("invalid magic")
     version, profile_count = struct.unpack_from("<II", data, 8)
-    if version != 1:
+    if version != 2:
         raise ValueError(f"unsupported version {version}")
     offset = 16 + 2 * 3 * 15 * 16
+    for _side in range(2):
+        for _signal in range(5):
+            (duration,) = struct.unpack_from("<f", data, offset)
+            offset += 4
+            if duration <= 0.0 or duration > 30.0:
+                raise ValueError(f"invalid hand-signal duration {duration}")
+            for _bone in range(15):
+                (key_count,) = struct.unpack_from("<I", data, offset)
+                offset += 4
+                if key_count == 0 or key_count > 64:
+                    raise ValueError(f"invalid hand-signal key count {key_count}")
+                previous_time = -1.0
+                for _key in range(key_count):
+                    time, x, y, z, w = struct.unpack_from("<5f", data, offset)
+                    offset += 20
+                    if time < previous_time or time < 0.0 or time > duration + 1.0e-4:
+                        raise ValueError(f"invalid hand-signal key time {time}")
+                    length = math.sqrt(x * x + y * y + z * z + w * w)
+                    if abs(length - 1.0) > 1.0e-3:
+                        raise ValueError("non-normalized hand-signal quaternion")
+                    previous_time = time
     data_profiles = set()
     for _ in range(profile_count):
         geometry_hash, vertex_count, bone_count = struct.unpack_from(

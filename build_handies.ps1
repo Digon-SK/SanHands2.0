@@ -3,6 +3,7 @@ param(
     [string]$RwFury = 'C:\Users\Digon\Documents\Fuentes\rwfury-master',
     [string]$DragonFF = 'C:\Users\Digon\AppData\Roaming\Blender Foundation\Blender\5.2\extensions\user_default\dragonff',
     [string]$PoseSource = 'C:\Users\Digon\Documents\ChatGPT\SanHands\dist\handpose.ifp',
+    [string]$GangAnimationSource = 'C:\Users\Digon\Documents\ChatGPT\SanHands\build\source_ghands.ifp',
     [string]$SourceModels = 'C:\Users\Digon\Desktop\peds',
     [string]$Hands = 'C:\Users\Digon\Desktop\hands',
     [string]$ModelsDir = 'C:\Users\Digon\Desktop\peds\con manos',
@@ -39,6 +40,7 @@ $RuntimeData = Join-Path $DistDir 'Handies.dat'
     --output $ModelsDir `
     --data $RuntimeData `
     --pose-source $PoseSource `
+    --gang-source $GangAnimationSource `
     --dragonff $DragonFF `
     --rwfury-root $RwFury
 if ($LASTEXITCODE -ne 0) {
