@@ -47,7 +47,7 @@ The defaults use:
 - MinGW 32-bit: `C:\msys64\mingw32`
 - plugin-sdk: `C:\Users\Digon\Documents\Fuentes\plugin-sdk-master`
 - pose source: `C:\Users\Digon\Documents\ChatGPT\SanHands\dist\handpose.ifp`
-- original gang-sign source: `C:\Users\Digon\Documents\ChatGPT\SanHands\build\source_ghands.ifp`
+- gang-sign source used by the installed mod: `C:\juegos\Grand Theft Auto San Andreas\modloader\hands\ghands.ifp`
 - Original peds: `C:\Users\Digon\Desktop\peds`
 - Native articulated hands: `C:\Users\Digon\Desktop\hands`
 - Final models: `C:\Users\Digon\Desktop\peds\con manos`

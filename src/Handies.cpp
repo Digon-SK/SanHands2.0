@@ -952,9 +952,8 @@ private:
     [[nodiscard]] static RpHAnimHierarchy* create_runtime_hierarchy(
         RpHAnimHierarchy* old_hierarchy) noexcept {
         if (old_hierarchy == nullptr || old_hierarchy->numNodes != native_bone_count ||
-            old_hierarchy->pNodeInfo == nullptr || old_hierarchy->currentAnim == nullptr ||
-            old_hierarchy->pMatrixArray == nullptr ||
-            old_hierarchy->parentFrame == nullptr) {
+            old_hierarchy->pNodeInfo == nullptr ||
+            old_hierarchy->pMatrixArray == nullptr) {
             return nullptr;
         }
         std::array<RwUInt32, runtime_bone_count> node_flags{};
@@ -975,25 +974,26 @@ private:
         RpHAnimHierarchy* hierarchy{RpHAnimHierarchyCreate(
             runtime_bone_count, node_flags.data(), node_ids.data(), hierarchy_flags,
             static_cast<RwInt32>(sizeof(RpHAnimBlendInterpFrame)))};
-        if (hierarchy == nullptr || hierarchy->currentAnim == nullptr) {
+        if (hierarchy == nullptr || hierarchy->pMatrixArray == nullptr ||
+            hierarchy->pNodeInfo == nullptr) {
             if (hierarchy != nullptr) RpHAnimHierarchyDestroy(hierarchy);
             return nullptr;
         }
-        RtAnimAnimation* animation{RpAnimBlendCreateAnimationForHierarchy(hierarchy)};
-        if (animation == nullptr ||
-            !RtAnimInterpolatorSetCurrentAnim(hierarchy->currentAnim, animation)) {
-            if (animation != nullptr) RtAnimAnimationDestroy(animation);
-            RpHAnimHierarchyDestroy(hierarchy);
-            return nullptr;
-        }
-        for (int index{}; index < native_bone_count; ++index) {
-            std::memcpy(rtANIMGETINTERPFRAME(hierarchy->currentAnim, index),
-                        rtANIMGETINTERPFRAME(old_hierarchy->currentAnim, index),
-                        sizeof(RpHAnimBlendInterpFrame));
-        }
+        // This hierarchy is a render-time matrix palette, not a participant in
+        // GTA's CAnimBlendClumpData. It deliberately owns no animation object.
+        // The parent frame is observed by the skin pipeline, but the frame's
+        // HAnim plugin remains attached to the original native hierarchy.
+        hierarchy->parentFrame = old_hierarchy->parentFrame;
         std::memcpy(hierarchy->pMatrixArray, old_hierarchy->pMatrixArray,
                     sizeof(RwMatrix) * native_bone_count);
         return hierarchy;
+    }
+
+    void log_injection_failure(const char* message) noexcept {
+        constexpr std::size_t maximum_failure_logs{24};
+        if (injection_failure_logs_ >= maximum_failure_logs) return;
+        ++injection_failure_logs_;
+        log(message);
     }
 
     [[nodiscard]] bool inject_runtime_skeleton(PedEntry& entry) {
@@ -1002,27 +1002,44 @@ private:
         RpHAnimHierarchy* primary_hierarchy{GetAnimHierarchyFromSkinClump(clump)};
         CAnimBlendClumpData* data{RpClumpGetAnimBlendClumpData(clump)};
         if (primary_hierarchy == nullptr || data == nullptr ||
-            data->m_nNumFrames != native_bone_count || data->m_pFrames == nullptr) {
+            data->m_nNumFrames < native_bone_count || data->m_pFrames == nullptr) {
+            std::array<char, 192> message{};
+            std::snprintf(
+                message.data(), message.size(),
+                "Inyeccion omitida: hierarchy=%p animData=%p frames=%d frameData=%p.",
+                static_cast<void*>(primary_hierarchy), static_cast<void*>(data),
+                data != nullptr ? data->m_nNumFrames : -1,
+                data != nullptr ? static_cast<void*>(data->m_pFrames) : nullptr);
+            log_injection_failure(message.data());
             return false;
         }
         AtomicList atomics{};
         RpClumpForAllAtomics(clump, collect_atomic, &atomics);
-        if (atomics.overflow || atomics.size == 0) return false;
+        if (atomics.overflow || atomics.size == 0) {
+            log_injection_failure("Inyeccion omitida: clump sin atomics utilizables.");
+            return false;
+        }
+        const AtomicList clump_atomics{atomics};
+        atomics = {};
         std::array<const RuntimeProfile*, max_atomics_per_ped> profiles{};
         std::array<std::size_t, max_atomics_per_ped> atomic_binding_indices{};
         std::array<HierarchyPlan, max_atomics_per_ped> plans{};
         std::size_t plan_count{};
-        for (std::size_t index{}; index < atomics.size; ++index) {
-            RpGeometry* geometry{RpAtomicGetGeometry(atomics.values[index])};
+        for (std::size_t source_index{}; source_index < clump_atomics.size;
+             ++source_index) {
+            RpAtomic* const atomic{clump_atomics.values[source_index]};
+            RpGeometry* geometry{RpAtomicGetGeometry(atomic)};
             RpSkin* skin{geometry != nullptr ? RpSkinGeometryGetSkin(geometry) : nullptr};
-            RpHAnimHierarchy* hierarchy{
-                RpSkinAtomicGetHAnimHierarchy(atomics.values[index])};
-            profiles[index] = find_profile(geometry);
+            RpHAnimHierarchy* hierarchy{RpSkinAtomicGetHAnimHierarchy(atomic)};
+            const RuntimeProfile* const profile{find_profile(geometry)};
             if (skin == nullptr || RpSkinGetNumBones(skin) != native_bone_count ||
-                profiles[index] == nullptr || hierarchy == nullptr ||
+                profile == nullptr || hierarchy == nullptr ||
                 hierarchy->numNodes != native_bone_count) {
-                return false;
+                continue;
             }
+            const std::size_t index{atomics.size++};
+            atomics.values[index] = atomic;
+            profiles[index] = profile;
             std::size_t binding_index{plan_count};
             for (std::size_t plan_index{}; plan_index < plan_count; ++plan_index) {
                 if (plans[plan_index].old_hierarchy == hierarchy &&
@@ -1037,11 +1054,36 @@ private:
             }
             atomic_binding_indices[index] = binding_index;
         }
+        if (atomics.size == 0) {
+            RpAtomic* const atomic{clump_atomics.values[0]};
+            RpGeometry* const geometry{atomic != nullptr
+                ? RpAtomicGetGeometry(atomic)
+                : nullptr};
+            RpSkin* const skin{geometry != nullptr
+                ? RpSkinGeometryGetSkin(geometry)
+                : nullptr};
+            RpHAnimHierarchy* const hierarchy{atomic != nullptr
+                ? RpSkinAtomicGetHAnimHierarchy(atomic)
+                : nullptr};
+            std::array<char, 256> message{};
+            std::snprintf(
+                message.data(), message.size(),
+                "Inyeccion omitida: atomics=%u vertices=%d hash=%016llX skinBones=%u hierarchyNodes=%d profile=0.",
+                static_cast<unsigned>(clump_atomics.size),
+                geometry != nullptr ? RpGeometryGetNumVertices(geometry) : -1,
+                static_cast<unsigned long long>(hash_geometry(geometry)),
+                skin != nullptr ? static_cast<unsigned>(RpSkinGetNumBones(skin)) : 0U,
+                hierarchy != nullptr ? hierarchy->numNodes : -1);
+            log_injection_failure(message.data());
+            return false;
+        }
         for (std::size_t index{}; index < plan_count; ++index) {
             plans[index].new_hierarchy =
                 create_runtime_hierarchy(plans[index].old_hierarchy);
             if (plans[index].new_hierarchy == nullptr) {
                 destroy_new_hierarchies(plans);
+                log_injection_failure(
+                    "Inyeccion omitida: no se pudo crear la paleta privada de 62 matrices.");
                 return false;
             }
         }
@@ -1052,6 +1094,8 @@ private:
             if (clone == nullptr) {
                 destroy_prepared(prepared);
                 destroy_new_hierarchies(plans);
+                log_injection_failure(
+                    "Inyeccion omitida: no se pudo clonar la geometria del ped.");
                 return false;
             }
             RuntimeProfile* profile{const_cast<RuntimeProfile*>(profiles[index])};
@@ -1062,6 +1106,8 @@ private:
                 RpGeometryDestroy(clone);
                 destroy_prepared(prepared);
                 destroy_new_hierarchies(plans);
+                log_injection_failure(
+                    "Inyeccion omitida: RpSkinCreate rechazo los pesos de 62 huesos.");
                 return false;
             }
             RpSkinGeometrySetSkin(clone, runtime_skin);
@@ -1306,6 +1352,7 @@ private:
     bool hand_object_hooks_installed_{};
     bool final_render_hook_attempted_{};
     bool final_render_hook_installed_{};
+    std::size_t injection_failure_logs_{};
 };
 
 HandiesMod handies_mod{};
