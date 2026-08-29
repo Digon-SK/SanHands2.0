@@ -299,19 +299,51 @@ def make_side_plan(
 
     source_geo = template["geo"]
     cut = min(vertex.x for vertex in source_geo.vertices) * ratio
-    arm_indices = {id_to_bone[bone_id].index for bone_id in required}
-    cut_vertices = set()
-    for index, (vertex, bone_indices, weights) in enumerate(
-        zip(geo.vertices, skin.vertex_bone_indices, skin.vertex_bone_weights)
-    ):
-        arm_weight = sum(weight for bone_index, weight in zip(bone_indices, weights) if bone_index in arm_indices)
-        local = mat_vec(inverse_forearm, vertex)
-        if arm_weight > 0.15 and local.x >= cut - 0.004:
-            cut_vertices.add(index)
-
-    removed = [
-        tri for tri in geo.triangles if cut_vertices.intersection((tri.a, tri.b, tri.c))
+    # Select only the original hand surface. Including forearm weights here can
+    # remove a complete low-poly wrist triangle and leave a visible gap. A
+    # triangle must have meaningful hand/finger influence and its centroid must
+    # sit at or beyond the replacement mesh's wrist overlap plane.
+    hand_indices = {
+        id_to_bone[config["hand"]].index,
+        id_to_bone[config["finger"]].index,
+        id_to_bone[config["finger1"]].index,
+    }
+    hand_weights = [
+        sum(weight for bone_index, weight in zip(bone_indices, weights) if bone_index in hand_indices)
+        for bone_indices, weights in zip(skin.vertex_bone_indices, skin.vertex_bone_weights)
     ]
+    local_x = [mat_vec(inverse_forearm, vertex).x for vertex in geo.vertices]
+    removed = []
+    for tri in geo.triangles:
+        indices = (tri.a, tri.b, tri.c)
+        centroid_x = sum(local_x[index] for index in indices) / 3.0
+        if max(hand_weights[index] for index in indices) > 0.20 and centroid_x >= cut - 0.002:
+            removed.append(tri)
+    # A handful of original models have one entire hand incorrectly weighted
+    # to the forearm. For those sides only, use the same centroid plane with
+    # the complete arm influence. The centroid test preserves every triangle
+    # crossing back into the forearm instead of opening the old wrist gap.
+    if len(removed) < 8:
+        arm_indices = hand_indices | {target_forearm_index}
+        arm_weights = [
+            sum(
+                weight
+                for bone_index, weight in zip(bone_indices, weights)
+                if bone_index in arm_indices
+            )
+            for bone_indices, weights in zip(
+                skin.vertex_bone_indices, skin.vertex_bone_weights
+            )
+        ]
+        removed = []
+        for tri in geo.triangles:
+            indices = (tri.a, tri.b, tri.c)
+            centroid_x = sum(local_x[index] for index in indices) / 3.0
+            if (
+                max(arm_weights[index] for index in indices) > 0.20
+                and centroid_x >= cut - 0.002
+            ):
+                removed.append(tri)
     if len(removed) < 8:
         raise ValueError(f"Only {len(removed)} {side} hand triangles selected")
 
