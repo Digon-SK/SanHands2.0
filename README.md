@@ -1,100 +1,82 @@
 # SanHands 2.0
 
-Batch conversion tool for GTA San Andreas pedestrian DFF models. It removes the original closed hand mesh at each wrist, inserts Rockstar's articulated `fhandl`/`fhandr` or `shandl`/`shandr` geometry, and extends the pedestrian skin with weighted finger bones.
+SanHands 2.0 adds articulated, animated fingers to GTA San Andreas pedestrians while preserving the game's native ped animation system.
 
-The converter selects the small or standard native hand according to each skeleton's proportions. It stitches the detailed eight-vertex wrist loop to the original low-poly forearm contour, even when the two loops have different vertex counts. The native hand UV island is remapped coherently into the pedestrian's dominant skin region so the fingers do not sample unrelated parts of the texture.
+The generated DFFs contain the replacement hand geometry, closed wrist seams, corrected UV islands, and **only the original 32-bone GTA ped skeleton**. The 26 additional finger bones are not stored in any ped model: `Handies.asi` creates them for each ped at runtime.
 
-## What it changes
+## Design
 
-- Replaces both original hand meshes at the wrist.
-- Closes the wrist with shared bridge triangles instead of leaving overlapping open edges.
-- Preserves the detailed hand's UV topology and assigns one dominant skin material per hand.
-- Preserves the standard forearm, hand, and two GTA finger bone IDs.
-- Adds 13 additional weighted finger bones per hand.
-- Produces a 58-bone skin for conventional pedestrians.
-- Copies matching TXD files without modifying them.
-- Handles DFFs containing more than one skinned geometry.
+- Replaces the original closed hand geometry at the wrist.
+- Joins the hand and forearm with bridge triangles, without gaps or overlapping open edges.
+- Preserves the detailed hand UV topology and maps it into the ped's dominant skin region.
+- Restores the original 32-node HAnim hierarchy and 32-bone Skin PLG before writing each final DFF.
+- Keeps GTA's normal walk, fight, weapon, gesture, and body animation associations at 32 frames.
+- Creates a private geometry and a 58-node render hierarchy only after GTA has initialized a ped normally.
+- Appends 13 runtime-only finger nodes per hand without shifting any native node.
+- Evaluates relaxed, grip/fist, and `FUCKU` finger poses after the native animation update.
+- Copies TXD files byte-for-byte.
 
-`player.dff` is copied unchanged. CJ uses a modular body assembled from `player.img`, and the base DFF has no conventional hand surface to replace.
+`player.dff` is copied unchanged because CJ uses a modular body assembled from `player.img` rather than a conventional pedestrian mesh.
 
-## Handies ASI
+## Runtime files
 
-`src/Handies.cpp` animates the added finger bones inside each converted ped. It
-does not create replacement `CHandObject` instances and does not hide the ped's
-embedded hands.
+The installed mod consists of:
 
-GTA builds its standard animation associations against the original 32-node
-`male01` skeleton. When those associations are copied to a converted 58-node
-ped, the original game keeps a 32-element blend-node array while its update loop
-walks all 58 frames. `Handies.asi` intercepts that update call and rebuilds any
-mismatched association against the actual clump, letting the game's own
-bone-tag lookup remap body tracks without changing their animations.
+- `Handies.asi`: runtime hierarchy injection and finger animation.
+- `Handies.dat`: geometry-specific skin weights, inverse bind matrices, finger offsets, and sampled hand poses.
+- `Handies.ini`: enable/player/NPC and transition-speed settings.
+- Final DFF/TXD files: hand geometry with the native skeleton only.
 
-The plugin loads `Handies.ifp` as two partial animations. These contain only the
-15 finger tracks for each side, remapped to the IDs emitted by `add_hands.py`.
-The original wrist, arm, body, weapon, and ragdoll transforms therefore continue
-to come from GTA and other animation mods.
+No IFP is installed. The finger rotations required by the mod are sampled into `Handies.dat` during the local build.
 
-Build and install the complete local mod with:
+Disable the older `SanHands.asi` while using this version. The old implementation creates separate replacement hand objects and is incompatible with embedded hand geometry.
+
+## Build and install
+
+Run:
 
 ```powershell
 .\build_handies.ps1
 ```
 
-Defaults target GTA SA 1.0 US, MinGW 32-bit at `C:\msys64\mingw32`, plugin-sdk
-at `C:\Users\Digon\Documents\Fuentes\plugin-sdk-master`, and installation at
-`C:\juegos\Grand Theft Auto San Andreas\modloader\Handies`. The generated IFP
-is derived locally from `SanHands\dist\handpose.ifp`; no game animation assets
-are committed to this repository.
+The defaults use:
 
-Disable the older `SanHands.asi` while using Handies. The older plugin creates
-separate hand objects by design, so loading both implementations would display
-duplicate systems.
+- MinGW 32-bit: `C:\msys64\mingw32`
+- plugin-sdk: `C:\Users\Digon\Documents\Fuentes\plugin-sdk-master`
+- pose source: `C:\Users\Digon\Documents\ChatGPT\SanHands\dist\handpose.ifp`
+- Original peds: `C:\Users\Digon\Desktop\peds`
+- Native articulated hands: `C:\Users\Digon\Desktop\hands`
+- Final models: `C:\Users\Digon\Desktop\peds\con manos`
+- Installation: `C:\juegos\Grand Theft Auto San Andreas\modloader\Handies`
+
+The script performs the complete pipeline: temporary authoring conversion, restoration of every native skeleton, structural validation, 32-bit ASI compilation, and installation.
+
+## Manual geometry conversion
+
+`add_hands.py` produces the temporary authoring form used to derive runtime weights:
+
+```powershell
+$env:DRAGONFF_PATH = "C:\path\to\dragonff"
+python add_hands.py `
+  --input "C:\path\to\peds" `
+  --hands "C:\path\to\hands" `
+  --output "C:\path\to\temporary-expanded" `
+  --copy-txd
+```
+
+Do not install that temporary 58-bone output. `tools/finalize_runtime_models.py` must restore the native skeleton and generate `Handies.dat`; the build script does both automatically.
 
 ## Requirements
 
 - Python 3.10 or newer.
-- A legally obtained PC copy of GTA San Andreas.
-- [DragonFF](https://github.com/Parik27/DragonFF), extracted locally. DragonFF's standalone `gtaLib/dff.py` module is used to read and write RenderWare files.
-- The four native articulated hand files: `fhandl.dff`, `fhandr.dff`, `shandl.dff`, and `shandr.dff`.
+- GTA San Andreas 1.0 US.
+- [plugin-sdk](https://github.com/DK22Pac/plugin-sdk).
+- [DragonFF](https://github.com/Parik27/DragonFF).
+- [rwfury](https://github.com/Parik27/rwfury).
+- A legally obtained copy of the required GTA assets.
 
-This repository intentionally contains no Rockstar Games assets. You must supply the DFF/TXD files from your own game installation.
-
-## Usage
-
-```powershell
-python add_hands.py `
-  --dragonff "C:\tools\DragonFF-master" `
-  --input "C:\path\to\peds" `
-  --hands "C:\path\to\hands" `
-  --output "C:\path\to\peds-with-hands" `
-  --copy-txd
-```
-
-The input directory is read non-recursively, so an output directory located inside it is not processed again. Existing source DFF/TXD files are never edited.
-
-To validate a completed batch independently:
-
-```powershell
-python validate_outputs.py `
-  --dragonff "C:\tools\DragonFF-master" `
-  --source "C:\path\to\peds" `
-  --hands "C:\path\to\hands" `
-  --output "C:\path\to\peds-with-hands"
-```
-
-Passing `--hands` enables additional checks for closed wrist bridges, finite UVs, and a single material on each replacement hand.
-
-Diagnostic helpers are also included:
-
-- `analyze_dff.py`: inspect frames, HAnim data, geometry, materials, and skin weights.
-- `audit_peds.py`: audit a directory for compatible pedestrian skeletons.
-- `inspect_hand_uv.py`: inspect original hand UV ranges and materials.
-
-## Important
-
-The generated DFF files pass structural round-trip validation through DragonFF, including frame parents, HAnim roots, skin matrices, weights, UV counts, and triangle indices. Test generated models in a separate mod-loader directory before replacing any installed game files.
+This repository contains no Rockstar Games DFF, TXD, IMG, or animation assets. Generated game files are excluded from Git.
 
 ## License
 
-SanHands 2.0 is released under the GNU General Public License v3.0 or later. DragonFF is a separate project distributed under its own GPL license.
+SanHands 2.0 is released under the GNU General Public License v3.0 or later. Its external dependencies retain their own licenses.

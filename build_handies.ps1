@@ -1,7 +1,10 @@
 param(
     [string]$PluginSdk = 'C:\Users\Digon\Documents\Fuentes\plugin-sdk-master',
     [string]$RwFury = 'C:\Users\Digon\Documents\Fuentes\rwfury-master',
+    [string]$DragonFF = 'C:\Users\Digon\AppData\Roaming\Blender Foundation\Blender\5.2\extensions\user_default\dragonff',
     [string]$PoseSource = 'C:\Users\Digon\Documents\ChatGPT\SanHands\dist\handpose.ifp',
+    [string]$SourceModels = 'C:\Users\Digon\Desktop\peds',
+    [string]$Hands = 'C:\Users\Digon\Desktop\hands',
     [string]$ModelsDir = 'C:\Users\Digon\Desktop\peds\con manos',
     [string]$InstallDir = 'C:\juegos\Grand Theft Auto San Andreas\modloader\Handies'
 )
@@ -9,19 +12,47 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProjectDir = $PSScriptRoot
 $DistDir = Join-Path $ProjectDir 'dist'
+$ExpandedDir = Join-Path $DistDir 'expanded-models'
 $Compiler = 'C:\msys64\mingw32\bin\g++.exe'
-$MingwBin = Split-Path -Parent $Compiler
-$env:PATH = "$MingwBin;$env:PATH"
+$env:PATH = "$(Split-Path -Parent $Compiler);$env:PATH"
+$env:DRAGONFF_PATH = $DragonFF
 
-New-Item -ItemType Directory -Force -Path $DistDir, $InstallDir | Out-Null
+New-Item -ItemType Directory -Force -Path `
+    $DistDir, $ExpandedDir, $ModelsDir, $InstallDir | Out-Null
 
-$EmbeddedPose = Join-Path $DistDir 'Handies.ifp'
-& python (Join-Path $ProjectDir 'tools\build_embedded_pose.py') `
-    --source $PoseSource `
-    --output $EmbeddedPose `
+# First build the already stitched/UV-mapped geometry with its temporary
+# 58-bone authoring rig. The finalizer immediately removes that rig from DFFs.
+& python (Join-Path $ProjectDir 'add_hands.py') `
+    --input $SourceModels `
+    --hands $Hands `
+    --output $ExpandedDir `
+    --dragonff $DragonFF `
+    --copy-txd
+if ($LASTEXITCODE -ne 0) {
+    throw "La integración geométrica de las manos falló con código $LASTEXITCODE"
+}
+
+$RuntimeData = Join-Path $DistDir 'Handies.dat'
+& python (Join-Path $ProjectDir 'tools\finalize_runtime_models.py') `
+    --source $SourceModels `
+    --expanded $ExpandedDir `
+    --output $ModelsDir `
+    --data $RuntimeData `
+    --pose-source $PoseSource `
+    --dragonff $DragonFF `
     --rwfury-root $RwFury
 if ($LASTEXITCODE -ne 0) {
-    throw "La generación de Handies.ifp falló con código $LASTEXITCODE"
+    throw "La restauración del esqueleto nativo falló con código $LASTEXITCODE"
+}
+
+& python (Join-Path $ProjectDir 'validate_outputs.py') `
+    --source $SourceModels `
+    --output $ModelsDir `
+    --hands $Hands `
+    --dragonff $DragonFF `
+    --runtime-data $RuntimeData
+if ($LASTEXITCODE -ne 0) {
+    throw "La validación del lote falló con código $LASTEXITCODE"
 }
 
 $IncludeDirs = @(
@@ -63,9 +94,17 @@ if ($LASTEXITCODE -ne 0) {
 
 Copy-Item -Force -LiteralPath `
     $OutputAsi, `
-    $EmbeddedPose, `
+    $RuntimeData, `
     (Join-Path $ProjectDir 'Handies.ini') `
     -Destination $InstallDir
+
+# Versiones anteriores instalaban un IFP parcial. Ya no se carga; se conserva
+# una copia desactivada y recuperable para evitar confundirlo con una
+# dependencia de esta versión.
+$OldIfp = Join-Path $InstallDir 'Handies.ifp'
+if (Test-Path -LiteralPath $OldIfp -PathType Leaf) {
+    Move-Item -LiteralPath $OldIfp -Destination "$OldIfp.obsolete" -Force
+}
 
 $ModelFiles = Get-ChildItem -LiteralPath $ModelsDir -File |
     Where-Object { $_.Extension -in '.dff', '.txd' }
@@ -77,4 +116,5 @@ if ($DffCount -ne 357 -or $TxdCount -ne 266) {
 $ModelFiles | Copy-Item -Destination $InstallDir -Force
 
 Write-Host "Handies compilado e instalado en $InstallDir"
-Write-Host "Modelos instalados: DFF=$DffCount TXD=$TxdCount"
+Write-Host "DFF nativos con geometría nueva: $DffCount; TXD: $TxdCount"
+Write-Host "Los 26 huesos de dedos se agregan únicamente en memoria por Handies.asi"

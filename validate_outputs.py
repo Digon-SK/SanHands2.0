@@ -16,11 +16,12 @@ parser.add_argument("--source", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--hands", type=Path)
 parser.add_argument("--dragonff", type=Path, default=DRAGONFF)
+parser.add_argument("--runtime-data", type=Path, required=True)
 args = parser.parse_args()
 
 source = args.source
 output = args.output
-expected_new_ids = set(range(1005, 1018)) | set(range(1105, 1118))
+runtime_only_ids = set(range(1005, 1018)) | set(range(1105, 1118))
 templates = None
 if args.hands:
     templates = {
@@ -42,6 +43,7 @@ dff_paths = sorted(output.glob("*.dff"))
 txd_paths = sorted(output.glob("*.txd"))
 errors = []
 geometries = 0
+geometry_profiles = set()
 
 expected_dff = len(list(source.glob("*.dff")))
 expected_txd = len(list(source.glob("*.txd")))
@@ -62,33 +64,88 @@ for path in dff_paths:
             if digest(path) != digest(source / path.name):
                 errors.append("player.dff: expected byte-identical modular skeleton")
             continue
-        for clump in model.clumps:
+        native_model = dff()
+        native_model.load_file(str(source / path.name))
+        if len(model.clumps) != len(native_model.clumps):
+            errors.append(f"{path.name}: native clump count changed")
+            continue
+        for clump_index, (clump, native_clump) in enumerate(
+            zip(model.clumps, native_model.clumps)
+        ):
+            if len(clump.frame_list) != len(native_clump.frame_list):
+                errors.append(f"{path.name}: native frame count changed")
+            else:
+                for frame_index, (frame, native_frame) in enumerate(
+                    zip(clump.frame_list, native_clump.frame_list)
+                ):
+                    if frame.parent != native_frame.parent:
+                        errors.append(
+                            f"{path.name}: frame {frame_index} parent changed"
+                        )
+                    output_bones = (
+                        [] if frame.bone_data is None else
+                        [(bone.id, bone.index, bone.type) for bone in frame.bone_data.bones]
+                    )
+                    native_bones = (
+                        [] if native_frame.bone_data is None else
+                        [
+                            (bone.id, bone.index, bone.type)
+                            for bone in native_frame.bone_data.bones
+                        ]
+                    )
+                    if output_bones != native_bones:
+                        errors.append(
+                            f"{path.name}: frame {frame_index} native HAnim changed"
+                        )
             roots = [frame for frame in clump.frame_list if frame.bone_data and frame.bone_data.bones]
             if len(roots) != len(clump.geometry_list):
                 errors.append(f"{path.name}: root/geometry count mismatch")
             for root in roots:
                 ids = {bone.id for bone in root.bone_data.bones}
-                if len(root.bone_data.bones) != 58 or root.bone_data.header.bone_count != 58:
-                    errors.append(f"{path.name}: HAnim root does not contain 58 bones")
-                if not expected_new_ids.issubset(ids):
-                    errors.append(f"{path.name}: native finger bone IDs are incomplete")
+                if len(root.bone_data.bones) != 32 or root.bone_data.header.bone_count != 32:
+                    errors.append(f"{path.name}: HAnim root is not the native 32-bone rig")
+                if runtime_only_ids.intersection(ids):
+                    errors.append(f"{path.name}: runtime-only finger IDs remained in DFF")
             for frame_index, frame in enumerate(clump.frame_list):
                 if frame.parent >= len(clump.frame_list):
                     errors.append(f"{path.name}: frame {frame_index} has invalid parent")
-            for geometry_index, geo in enumerate(clump.geometry_list):
+            if len(clump.geometry_list) != len(native_clump.geometry_list):
+                errors.append(f"{path.name}: native geometry count changed")
+                continue
+            for geometry_index, (geo, native_geo) in enumerate(
+                zip(clump.geometry_list, native_clump.geometry_list)
+            ):
                 geometries += 1
                 skin = geo.extensions.get("skin")
                 count = len(geo.vertices)
-                if skin is None or skin.num_bones != 58 or len(skin.bone_matrices) != 58:
-                    errors.append(f"{path.name}: invalid 58-bone Skin PLG")
+                geometry_hash = 0xCBF29CE484222325
+                for vertex in geo.vertices:
+                    for byte in struct.pack("<3f", vertex.x, vertex.y, vertex.z):
+                        geometry_hash ^= byte
+                        geometry_hash = (geometry_hash * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+                geometry_profiles.add((geometry_hash, count))
+                if skin is None or skin.num_bones != 32 or len(skin.bone_matrices) != 32:
+                    errors.append(f"{path.name}: invalid native 32-bone Skin PLG")
                     continue
+                native_skin = native_geo.extensions.get("skin")
+                if native_skin is None or any(
+                    abs(value - native_value) > 1.0e-5
+                    for matrix, native_matrix in zip(
+                        skin.bone_matrices, native_skin.bone_matrices
+                    )
+                    for row, native_row in zip(matrix, native_matrix)
+                    for value, native_value in zip(row, native_row)
+                ):
+                    errors.append(
+                        f"{path.name}: geometry {geometry_index} native bind matrices changed"
+                    )
                 if len(skin.vertex_bone_indices) != count or len(skin.vertex_bone_weights) != count:
                     errors.append(f"{path.name}: skin/vertex mismatch")
                 if geo.normals and len(geo.normals) != count:
                     errors.append(f"{path.name}: normal/vertex mismatch")
                 if any(len(layer) != count for layer in geo.uv_layers):
                     errors.append(f"{path.name}: UV/vertex mismatch")
-                if any(max(indices) >= 58 for indices in skin.vertex_bone_indices):
+                if any(max(indices) >= 32 for indices in skin.vertex_bone_indices):
                     errors.append(f"{path.name}: out-of-range skin index")
                 if any(max(tri.a, tri.b, tri.c) >= count for tri in geo.triangles):
                     errors.append(f"{path.name}: out-of-range triangle index")
@@ -142,6 +199,32 @@ for path in txd_paths:
     original = source / path.name
     if not original.exists() or digest(path) != digest(original):
         errors.append(f"{path.name}: texture differs from source")
+
+try:
+    data = args.runtime_data.read_bytes()
+    if len(data) < 16 or data[:8] != b"HND2DAT\0":
+        raise ValueError("invalid magic")
+    version, profile_count = struct.unpack_from("<II", data, 8)
+    if version != 1:
+        raise ValueError(f"unsupported version {version}")
+    offset = 16 + 2 * 3 * 15 * 16
+    data_profiles = set()
+    for _ in range(profile_count):
+        geometry_hash, vertex_count, bone_count = struct.unpack_from(
+            "<QII", data, offset
+        )
+        if bone_count != 58:
+            raise ValueError(f"runtime profile has {bone_count} bones")
+        data_profiles.add((geometry_hash, vertex_count))
+        offset += 16 + 30 * 12 + vertex_count * 4 + vertex_count * 16 + 58 * 64
+    if offset != len(data):
+        raise ValueError(f"trailing/truncated bytes: parsed {offset}, file {len(data)}")
+    if data_profiles != geometry_profiles:
+        missing = len(geometry_profiles - data_profiles)
+        extra = len(data_profiles - geometry_profiles)
+        raise ValueError(f"profile mismatch: missing={missing} extra={extra}")
+except Exception as exc:
+    errors.append(f"Handies.dat: {exc}")
 
 print(
     f"VALIDATION dff={len(dff_paths)} txd={len(txd_paths)} "
