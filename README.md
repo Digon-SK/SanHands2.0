@@ -14,6 +14,7 @@ The generated DFFs contain the replacement hand geometry, closed wrist seams, co
 - Creates a private geometry and a 58-node render hierarchy only after GTA has initialized a ped normally.
 - Appends 13 runtime-only finger nodes per hand without shifting any native node.
 - Evaluates relaxed, grip/fist, `FUCKU`, and the ten original gang-sign finger tracks after the native animation update.
+- Reapplies the finger matrices at the final `RpClumpRender` call, after `CPed::PreRender`, so native and graphics-mod skeleton refreshes cannot overwrite the articulated pose.
 - Uses the active native hand-signal task's animation ID and playback time, while suppressing only its separate replacement-hand render pass.
 - Copies TXD files byte-for-byte.
 

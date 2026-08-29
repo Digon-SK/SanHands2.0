@@ -44,6 +44,7 @@ namespace handies {
 namespace {
 
 constexpr std::uintptr_t update_animations_call_address{0x535F94};
+constexpr std::uintptr_t entity_render_clump_call_address{0x53439C};
 constexpr std::size_t max_tracked_peds{256};
 constexpr std::size_t max_atomics_per_ped{16};
 constexpr int native_bone_count{32};
@@ -538,6 +539,7 @@ public:
 
 private:
     using UpdateAnimationsFunction = void(__cdecl*)(RpClump*, float, bool);
+    using ClumpRenderFunction = RpClump*(__cdecl*)(RpClump*);
 
     void resolve_module_paths() noexcept {
         HMODULE module{};
@@ -724,6 +726,37 @@ private:
         log(original_update_animations_ != nullptr
                 ? "Hook nativo de actualización instalado."
                 : "ERROR: no se pudo instalar el hook de actualización.");
+    }
+
+    void install_final_render_hook() noexcept {
+        if (final_render_hook_attempted_) return;
+        final_render_hook_attempted_ = true;
+
+        // CPed::PreRender updates RpHAnim after the gameplay animation pass.
+        // Apply the private finger nodes at CEntity::Render's final
+        // RpClumpRender call so neither GTA nor Inertia3D can overwrite them
+        // before the skin pipeline consumes the matrices.
+        if (injector::ReadMemory<std::uint8_t>(
+                entity_render_clump_call_address, true) != 0xE8U) {
+            log("ERROR: la llamada final a RpClumpRender no es compatible.");
+            return;
+        }
+        const auto previous{injector::MakeCALL(
+            entity_render_clump_call_address,
+            injector::raw_ptr(&render_clump_with_animated_fingers))};
+        original_clump_render_ = previous.get();
+        final_render_hook_installed_ = original_clump_render_ != nullptr;
+        log(final_render_hook_installed_
+                ? "Deformacion final de dedos enlazada a RpClumpRender."
+                : "ERROR: no se pudo enlazar la deformacion final de dedos.");
+    }
+
+    static RpClump* __cdecl render_clump_with_animated_fingers(
+        RpClump* clump) noexcept {
+        if (instance_ != nullptr) instance_->apply_for_clump(clump);
+        return original_clump_render_ != nullptr
+            ? original_clump_render_(clump)
+            : clump;
     }
 
     void install_hand_object_hooks() noexcept {
@@ -1057,6 +1090,9 @@ private:
 
     void on_game_process() noexcept {
         if (!settings_.enabled) return;
+        // Handies is loaded before some graphics ASIs. Installing on the first
+        // gameplay tick preserves and chains the final target chosen by them.
+        install_final_render_hook();
         for (auto& entry : entries_) {
             if (entry.ped == nullptr) continue;
             update_finger_state(entry);
@@ -1168,9 +1204,12 @@ private:
     inline static HandiesMod* instance_{};
     inline static UpdateAnimationsFunction original_update_animations_{
         reinterpret_cast<UpdateAnimationsFunction>(0x4D34F0)};
+    inline static ClumpRenderFunction original_clump_render_{};
     inline static std::uintptr_t original_hand_pre_render_{0x59ECD0};
     inline static std::uintptr_t original_hand_render_{0x59EE80};
     bool hand_object_hooks_installed_{};
+    bool final_render_hook_attempted_{};
+    bool final_render_hook_installed_{};
 };
 
 HandiesMod handies_mod{};
