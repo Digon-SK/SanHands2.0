@@ -22,7 +22,7 @@ New-Item -ItemType Directory -Force -Path `
     $DistDir, $ExpandedDir, $ModelsDir, $InstallDir | Out-Null
 
 # First build the already stitched/UV-mapped geometry with its temporary
-# 58-bone authoring rig. The finalizer immediately removes that rig from DFFs.
+# 62-bone authoring rig. The finalizer immediately removes that rig from DFFs.
 & python (Join-Path $ProjectDir 'add_hands.py') `
     --input $SourceModels `
     --hands $Hands `
@@ -119,4 +119,4 @@ $ModelFiles | Copy-Item -Destination $InstallDir -Force
 
 Write-Host "Handies compilado e instalado en $InstallDir"
 Write-Host "DFF nativos con geometría nueva: $DffCount; TXD: $TxdCount"
-Write-Host "Los 26 huesos de dedos se agregan únicamente en memoria por Handies.asi"
+Write-Host "Los 30 huesos de dedos se agregan únicamente en memoria por Handies.asi"

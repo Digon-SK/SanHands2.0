@@ -2,7 +2,7 @@
 
 SanHands 2.0 adds articulated, animated fingers to GTA San Andreas pedestrians while preserving the game's native ped animation system.
 
-The generated DFFs contain the replacement hand geometry, closed wrist seams, corrected UV islands, and **only the original 32-bone GTA ped skeleton**. The 26 additional finger bones are not stored in any ped model: `Handies.asi` creates them for each ped at runtime.
+The generated DFFs contain the replacement hand geometry, closed wrist seams, corrected UV islands, and **only the original 32-bone GTA ped skeleton**. The 30 additional finger bones are not stored in any ped model: `Handies.asi` creates them for each ped at runtime.
 
 ## Design
 
@@ -11,10 +11,11 @@ The generated DFFs contain the replacement hand geometry, closed wrist seams, co
 - Preserves the detailed hand UV topology and maps it into the ped's dominant skin region.
 - Restores the original 32-node HAnim hierarchy and 32-bone Skin PLG before writing each final DFF.
 - Keeps GTA's normal walk, fight, weapon, gesture, and body animation associations at 32 frames.
-- Creates a private geometry and a 58-node render hierarchy only after GTA has initialized a ped normally.
-- Appends 13 runtime-only finger nodes per hand without shifting any native node.
+- Creates a private geometry and a 62-node render hierarchy only after GTA has initialized a ped normally.
+- Appends the complete 15-node gang-hand hierarchy to each native `hand` node without reusing or changing GTA's `finger` and `finger01` nodes.
 - Evaluates relaxed, grip/fist, `FUCKU`, and the ten original gang-sign finger tracks after the native animation update.
-- Reapplies the finger matrices at the final `RpClumpRender` call, after `CPed::PreRender`, so native and graphics-mod skeleton refreshes cannot overwrite the articulated pose.
+- Temporarily swaps each atomic to the private hierarchy only during the final `RpClumpRender` call, then immediately restores its native hierarchy.
+- Leaves the native 32-frame hierarchy, `CAnimBlendClumpData`, animations, and ownership untouched, following the separate-hierarchy behavior used by GTA's `CHandObject` system.
 - Uses the active native hand-signal task's animation ID and playback time, while suppressing only its separate replacement-hand render pass.
 - Copies TXD files byte-for-byte.
 
@@ -67,7 +68,7 @@ python add_hands.py `
   --copy-txd
 ```
 
-Do not install that temporary 58-bone output. `tools/finalize_runtime_models.py` must restore the native skeleton and generate `Handies.dat`; the build script does both automatically.
+Do not install that temporary 62-bone output. `tools/finalize_runtime_models.py` must restore the native skeleton and generate `Handies.dat`; the build script does both automatically.
 
 ## Requirements
 

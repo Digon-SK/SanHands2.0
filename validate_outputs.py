@@ -21,7 +21,7 @@ args = parser.parse_args()
 
 source = args.source
 output = args.output
-runtime_only_ids = set(range(1005, 1018)) | set(range(1105, 1118))
+runtime_only_ids = set(range(1003, 1018)) | set(range(1103, 1118))
 templates = None
 if args.hands:
     templates = {
@@ -205,7 +205,7 @@ try:
     if len(data) < 16 or data[:8] != b"HND2DAT\0":
         raise ValueError("invalid magic")
     version, profile_count = struct.unpack_from("<II", data, 8)
-    if version != 2:
+    if version != 3:
         raise ValueError(f"unsupported version {version}")
     offset = 16 + 2 * 3 * 15 * 16
     for _side in range(2):
@@ -234,10 +234,10 @@ try:
         geometry_hash, vertex_count, bone_count = struct.unpack_from(
             "<QII", data, offset
         )
-        if bone_count != 58:
+        if bone_count != 62:
             raise ValueError(f"runtime profile has {bone_count} bones")
         data_profiles.add((geometry_hash, vertex_count))
-        offset += 16 + 30 * 12 + vertex_count * 4 + vertex_count * 16 + 58 * 64
+        offset += 16 + 30 * 12 + vertex_count * 4 + vertex_count * 16 + 62 * 64
     if offset != len(data):
         raise ValueError(f"trailing/truncated bytes: parsed {offset}, file {len(data)}")
     if data_profiles != geometry_profiles:

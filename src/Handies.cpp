@@ -3,8 +3,8 @@
 
     DFF files retain the native 32-node ped hierarchy. After GTA completes its
     normal animation setup, this plugin gives each ped a private geometry and
-    appends 26 runtime-only finger nodes. GTA continues animating only its
-    original 32 frames; Handies evaluates the fingers after each native update.
+    appends 30 runtime-only finger nodes. GTA continues animating only its
+    original 32 frames; Handies evaluates the fingers only for the skin render.
 */
 
 #include "plugin.h"
@@ -15,6 +15,7 @@
 #include "CHandObject.h"
 #include "CPed.h"
 #include "CPedIntelligence.h"
+#include "CPools.h"
 #include "CTask.h"
 #include "CTaskManager.h"
 #include "CTimer.h"
@@ -48,19 +49,19 @@ constexpr std::uintptr_t entity_render_clump_call_address{0x53439C};
 constexpr std::size_t max_tracked_peds{256};
 constexpr std::size_t max_atomics_per_ped{16};
 constexpr int native_bone_count{32};
-constexpr int runtime_bone_count{58};
+constexpr int runtime_bone_count{62};
 constexpr int finger_bones_per_hand{15};
 constexpr int pose_count{3};
 constexpr int hand_signal_count{5};
 constexpr int left_hand_id{34};
 constexpr int right_hand_id{24};
-constexpr int left_extra_id_base{1005};
-constexpr int right_extra_id_base{1105};
+constexpr int left_extra_id_base{1003};
+constexpr int right_extra_id_base{1103};
 constexpr char data_file_name[]{"Handies.dat"};
 constexpr char ini_file_name[]{"Handies.ini"};
 constexpr char log_file_name[]{"Handies.log"};
 constexpr std::array<char, 8> data_magic{'H', 'N', 'D', '2', 'D', 'A', 'T', '\0'};
-constexpr std::uint32_t data_version{2};
+constexpr std::uint32_t data_version{3};
 constexpr float minimum_visible_animation_blend{0.01F};
 constexpr std::uintptr_t hand_object_vtable_address{0x866EE0};
 constexpr std::uintptr_t hand_object_pre_render_slot{
@@ -137,8 +138,14 @@ static_assert(offsetof(NativeHandSignalTaskView, hand_animation_id) == 0x10);
 static_assert(offsetof(NativeHandSignalTaskView, right_hand) == 0x20);
 
 struct RuntimeBinding {
-    RpHAnimHierarchy* hierarchy{};
+    RpHAnimHierarchy* source_hierarchy{};
+    RpHAnimHierarchy* render_hierarchy{};
     const RuntimeProfile* profile{};
+};
+
+struct RuntimeAtomic {
+    RpAtomic* atomic{};
+    std::size_t binding_index{};
 };
 
 struct PedEntry {
@@ -146,6 +153,8 @@ struct PedEntry {
     RpClump* clump{};
     std::array<RuntimeBinding, max_atomics_per_ped> bindings{};
     std::size_t binding_count{};
+    std::array<RuntimeAtomic, max_atomics_per_ped> atomics{};
+    std::size_t atomic_count{};
     float grip{};
     float fucku_blend{};
 };
@@ -357,14 +366,7 @@ private:
 }
 
 [[nodiscard]] int target_bone_id(int side, int source_id) noexcept {
-    if (side == 0) {
-        if (source_id == 3) return 35;
-        if (source_id == 4) return 36;
-        return 1000 + source_id;
-    }
-    if (source_id == 3) return 25;
-    if (source_id == 4) return 26;
-    return 1100 + source_id;
+    return (side == 0 ? 1000 : 1100) + source_id;
 }
 
 [[nodiscard]] int parent_source_id(int source_id) noexcept {
@@ -516,8 +518,9 @@ public:
                 : "ERROR: Handies.dat no pudo cargarse; el mod queda inactivo.");
 
         plugin::Events::initGameEvent += [this] {
-            entries_.fill({});
+            release_all();
             load_settings();
+            install_final_render_hook();
             if (profiles_.empty() && !load_runtime_data()) {
                 log("ERROR: Handies.dat sigue sin estar disponible al iniciar partida.");
             } else {
@@ -534,7 +537,7 @@ public:
         plugin::Events::pedDtorEvent.before += [this](CPed* ped) {
             remove_for_ped(ped);
         };
-        plugin::Events::shutdownPoolsEvent += [this] { entries_.fill({}); };
+        plugin::Events::shutdownPoolsEvent += [this] { release_all(); };
     }
 
 private:
@@ -542,6 +545,15 @@ private:
     using ClumpRenderFunction = RpClump*(__cdecl*)(RpClump*);
 
     void resolve_module_paths() noexcept {
+        std::array<char, MAX_PATH> temp_path{};
+        const DWORD temp_length{GetTempPathA(
+            static_cast<DWORD>(temp_path.size()), temp_path.data())};
+        if (temp_length > 0 && temp_length < temp_path.size()) {
+            std::snprintf(fallback_log_path_.data(), fallback_log_path_.size(),
+                          "%s%s", temp_path.data(), log_file_name);
+        } else {
+            std::strcpy(fallback_log_path_.data(), log_file_name);
+        }
         HMODULE module{};
         const auto address{reinterpret_cast<LPCSTR>(this)};
         if (GetModuleHandleExA(
@@ -580,17 +592,30 @@ private:
     }
 
     void log(const char* message) const noexcept {
+        OutputDebugStringA("Handies: ");
+        OutputDebugStringA(message);
+        OutputDebugStringA("\r\n");
+        static_cast<void>(append_log(log_path_.data(), message));
+        if (_stricmp(log_path_.data(), fallback_log_path_.data()) != 0) {
+            static_cast<void>(append_log(fallback_log_path_.data(), message));
+        }
+    }
+
+    [[nodiscard]] static bool append_log(
+        const char* path,
+        const char* message) noexcept {
         const HANDLE file{CreateFileA(
-            log_path_.data(), FILE_APPEND_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL, nullptr)};
-        if (file == INVALID_HANDLE_VALUE) return;
+            path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)};
+        if (file == INVALID_HANDLE_VALUE) return false;
         DWORD written{};
-        WriteFile(file, message, static_cast<DWORD>(std::strlen(message)),
-                  &written, nullptr);
+        const BOOL message_written{WriteFile(
+            file, message, static_cast<DWORD>(std::strlen(message)), &written,
+            nullptr)};
         constexpr char newline[]{"\r\n"};
-        WriteFile(file, newline, 2, &written, nullptr);
+        const BOOL newline_written{WriteFile(file, newline, 2, &written, nullptr)};
         CloseHandle(file);
+        return message_written != FALSE && newline_written != FALSE;
     }
 
     [[nodiscard]] bool load_runtime_data() {
@@ -753,10 +778,16 @@ private:
 
     static RpClump* __cdecl render_clump_with_animated_fingers(
         RpClump* clump) noexcept {
-        if (instance_ != nullptr) instance_->apply_for_clump(clump);
-        return original_clump_render_ != nullptr
+        PedEntry* const entry{instance_ != nullptr
+            ? instance_->prepare_for_clump_render(clump)
+            : nullptr};
+        RpClump* const result{original_clump_render_ != nullptr
             ? original_clump_render_(clump)
-            : clump;
+            : clump};
+        if (instance_ != nullptr && entry != nullptr) {
+            instance_->restore_native_hierarchies(*entry);
+        }
+        return result;
     }
 
     void install_hand_object_hooks() noexcept {
@@ -889,18 +920,33 @@ private:
     static void destroy_new_hierarchies(
         std::array<HierarchyPlan, max_atomics_per_ped>& plans) noexcept {
         for (auto& plan : plans) {
-            if (plan.new_hierarchy == nullptr) continue;
-            RtAnimAnimation* animation{
-                plan.new_hierarchy->currentAnim != nullptr
-                    ? plan.new_hierarchy->currentAnim->pCurrentAnim
-                    : nullptr};
-            if (animation != nullptr) {
-                RtAnimAnimationDestroy(animation);
-                plan.new_hierarchy->currentAnim->pCurrentAnim = nullptr;
-            }
-            RpHAnimHierarchyDestroy(plan.new_hierarchy);
+            destroy_runtime_hierarchy(plan.new_hierarchy);
             plan.new_hierarchy = nullptr;
         }
+    }
+
+    static void destroy_runtime_hierarchy(
+        RpHAnimHierarchy* hierarchy) noexcept {
+        if (hierarchy == nullptr) return;
+        RtAnimAnimation* animation{hierarchy->currentAnim != nullptr
+            ? hierarchy->currentAnim->pCurrentAnim
+            : nullptr};
+        if (animation != nullptr) {
+            RtAnimAnimationDestroy(animation);
+            hierarchy->currentAnim->pCurrentAnim = nullptr;
+        }
+        RpHAnimHierarchyDestroy(hierarchy);
+    }
+
+    static void destroy_entry(PedEntry& entry) noexcept {
+        for (std::size_t index{}; index < entry.binding_count; ++index) {
+            destroy_runtime_hierarchy(entry.bindings[index].render_hierarchy);
+        }
+        entry = {};
+    }
+
+    void release_all() noexcept {
+        for (auto& entry : entries_) destroy_entry(entry);
     }
 
     [[nodiscard]] static RpHAnimHierarchy* create_runtime_hierarchy(
@@ -918,9 +964,10 @@ private:
                 static_cast<RwUInt32>(old_hierarchy->pNodeInfo[index].flags);
             node_ids[index] = old_hierarchy->pNodeInfo[index].nodeID;
         }
-        for (int offset{}; offset < 13; ++offset) {
+        for (int offset{}; offset < finger_bones_per_hand; ++offset) {
             node_ids[native_bone_count + offset] = left_extra_id_base + offset;
-            node_ids[native_bone_count + 13 + offset] = right_extra_id_base + offset;
+            node_ids[native_bone_count + finger_bones_per_hand + offset] =
+                right_extra_id_base + offset;
         }
         const auto hierarchy_flags{static_cast<RpHAnimHierarchyFlag>(
             rpHANIMHIERARCHYUPDATEMODELLINGMATRICES |
@@ -978,7 +1025,8 @@ private:
             }
             std::size_t binding_index{plan_count};
             for (std::size_t plan_index{}; plan_index < plan_count; ++plan_index) {
-                if (plans[plan_index].old_hierarchy == hierarchy) {
+                if (plans[plan_index].old_hierarchy == hierarchy &&
+                    plans[plan_index].profile == profiles[index]) {
                     binding_index = plan_index;
                     break;
                 }
@@ -989,7 +1037,6 @@ private:
             }
             atomic_binding_indices[index] = binding_index;
         }
-        std::size_t primary_binding{plan_count};
         for (std::size_t index{}; index < plan_count; ++index) {
             plans[index].new_hierarchy =
                 create_runtime_hierarchy(plans[index].old_hierarchy);
@@ -997,13 +1044,6 @@ private:
                 destroy_new_hierarchies(plans);
                 return false;
             }
-            if (plans[index].old_hierarchy == primary_hierarchy) {
-                primary_binding = index;
-            }
-        }
-        if (primary_binding == plan_count) {
-            destroy_new_hierarchies(plans);
-            return false;
         }
 
         std::array<PreparedAtomic, max_atomics_per_ped> prepared{};
@@ -1031,61 +1071,78 @@ private:
 
         for (std::size_t index{}; index < atomics.size; ++index) {
             RpAtomicSetGeometry(prepared[index].atomic, prepared[index].geometry, 0);
+            // Outside the actual draw call GTA must continue seeing its native
+            // 32-node hierarchy. The private 62-node hierarchy is swapped in
+            // only around RpClumpRender.
             RpSkinAtomicSetHAnimHierarchy(
                 prepared[index].atomic,
-                plans[prepared[index].binding_index].new_hierarchy);
+                plans[prepared[index].binding_index].old_hierarchy);
             RpGeometryDestroy(prepared[index].geometry);
             prepared[index].geometry = nullptr;
-        }
-        for (std::size_t index{}; index < plan_count; ++index) {
-            RwFrame* owner_frame{plans[index].old_hierarchy->parentFrame};
-            RpHAnimFrameSetHierarchy(owner_frame, plans[index].new_hierarchy);
-            plans[index].new_hierarchy->parentFrame = owner_frame;
-        }
-        for (int index{}; index < native_bone_count; ++index) {
-            data->m_pFrames[index].m_pIFrame = reinterpret_cast<IFrame*>(
-                rtANIMGETINTERPFRAME(
-                    plans[primary_binding].new_hierarchy->currentAnim, index));
-        }
-        for (std::size_t index{}; index < plan_count; ++index) {
-            RtAnimAnimation* old_animation{
-                plans[index].old_hierarchy->currentAnim->pCurrentAnim};
-            if (old_animation != nullptr) {
-                RtAnimAnimationDestroy(old_animation);
-                plans[index].old_hierarchy->currentAnim->pCurrentAnim = nullptr;
-            }
-            RpHAnimHierarchyDestroy(plans[index].old_hierarchy);
         }
         entry.clump = clump;
         entry.binding_count = plan_count;
         for (std::size_t index{}; index < plan_count; ++index) {
             entry.bindings[index] = {
-                plans[index].new_hierarchy, plans[index].profile};
+                plans[index].old_hierarchy,
+                plans[index].new_hierarchy,
+                plans[index].profile};
+            plans[index].new_hierarchy = nullptr;
         }
+        entry.atomic_count = atomics.size;
+        for (std::size_t index{}; index < atomics.size; ++index) {
+            entry.atomics[index] = {
+                atomics.values[index], atomic_binding_indices[index]};
+        }
+        log("Ped preparado: jerarquia nativa 32 intacta y 30 dedos privados listos.");
         return true;
     }
 
     void on_ped_render(CPed* ped) noexcept {
+        PedEntry* const entry{prepare_entry_for_ped(ped)};
+        if (entry != nullptr) apply_finger_matrices(*entry);
+    }
+
+    [[nodiscard]] bool is_enabled_for(const CPed* ped) const noexcept {
         if (!settings_.enabled || profiles_.empty() || ped == nullptr ||
-            ped->m_pRwClump == nullptr) return;
+            ped->m_pRwClump == nullptr) {
+            return false;
+        }
         const bool is_player{ped == FindPlayerPed()};
-        if ((is_player && !settings_.enable_player) ||
-            (!is_player && !settings_.enable_npcs)) return;
+        return (is_player && settings_.enable_player) ||
+            (!is_player && settings_.enable_npcs);
+    }
+
+    [[nodiscard]] PedEntry* prepare_entry_for_ped(CPed* ped) noexcept {
+        if (!is_enabled_for(ped)) return nullptr;
         PedEntry* entry{reserve_entry(ped)};
-        if (entry == nullptr) return;
+        if (entry == nullptr) return nullptr;
         if (entry->clump == nullptr) {
             try {
                 if (!inject_runtime_skeleton(*entry)) {
-                    *entry = {};
-                    return;
+                    destroy_entry(*entry);
+                    return nullptr;
                 }
             } catch (...) {
-                *entry = {};
+                destroy_entry(*entry);
                 log("ERROR: excepción al preparar un ped; se conservó su modelo nativo.");
-                return;
+                return nullptr;
             }
         }
-        apply_finger_matrices(*entry);
+        return entry;
+    }
+
+    [[nodiscard]] static CPed* find_ped_for_clump(RpClump* clump) noexcept {
+        auto* const pool{CPools::ms_pPedPool};
+        if (clump == nullptr || pool == nullptr || pool->m_pObjects == nullptr ||
+            pool->m_byteMap == nullptr) {
+            return nullptr;
+        }
+        for (int index{}; index < pool->m_nSize; ++index) {
+            CPed* const ped{pool->GetAt(index)};
+            if (ped != nullptr && ped->m_pRwClump == clump) return ped;
+        }
+        return nullptr;
     }
 
     void on_game_process() noexcept {
@@ -1118,31 +1175,69 @@ private:
         }
     }
 
+    [[nodiscard]] PedEntry* prepare_for_clump_render(RpClump* clump) noexcept {
+        PedEntry* entry{find_entry_by_clump(clump)};
+        if (entry == nullptr) {
+            entry = prepare_entry_for_ped(find_ped_for_clump(clump));
+            if (entry == nullptr) return nullptr;
+            update_finger_state(*entry);
+        }
+        apply_finger_matrices(*entry);
+        for (std::size_t index{}; index < entry->atomic_count; ++index) {
+            const RuntimeAtomic& item{entry->atomics[index]};
+            if (item.atomic == nullptr || item.binding_index >= entry->binding_count) {
+                continue;
+            }
+            RpSkinAtomicSetHAnimHierarchy(
+                item.atomic,
+                entry->bindings[item.binding_index].render_hierarchy);
+        }
+        return entry;
+    }
+
+    static void restore_native_hierarchies(PedEntry& entry) noexcept {
+        for (std::size_t index{}; index < entry.atomic_count; ++index) {
+            const RuntimeAtomic& item{entry.atomics[index]};
+            if (item.atomic == nullptr || item.binding_index >= entry.binding_count) {
+                continue;
+            }
+            RpSkinAtomicSetHAnimHierarchy(
+                item.atomic,
+                entry.bindings[item.binding_index].source_hierarchy);
+        }
+    }
+
     void apply_finger_matrices(PedEntry& entry) const noexcept {
         const HandSignalState signal{entry.ped != nullptr
             ? read_hand_signal_state(*entry.ped)
             : HandSignalState{}};
         for (std::size_t binding_index{};
              binding_index < entry.binding_count;
-             ++binding_index) {
+            ++binding_index) {
             const RuntimeBinding& binding{entry.bindings[binding_index]};
-            if (binding.hierarchy == nullptr || binding.profile == nullptr ||
-                binding.hierarchy->numNodes != runtime_bone_count ||
-                binding.hierarchy->pMatrixArray == nullptr) {
+            if (binding.source_hierarchy == nullptr ||
+                binding.render_hierarchy == nullptr || binding.profile == nullptr ||
+                binding.source_hierarchy->numNodes != native_bone_count ||
+                binding.source_hierarchy->pMatrixArray == nullptr ||
+                binding.render_hierarchy->numNodes != runtime_bone_count ||
+                binding.render_hierarchy->pMatrixArray == nullptr) {
                 continue;
             }
-            RwMatrix* matrices{binding.hierarchy->pMatrixArray};
+            RwMatrix* matrices{binding.render_hierarchy->pMatrixArray};
+            std::memcpy(
+                matrices, binding.source_hierarchy->pMatrixArray,
+                sizeof(RwMatrix) * native_bone_count);
             for (int side{}; side < 2; ++side) {
                 for (int source_id{3}; source_id <= 17; ++source_id) {
                     const int target_id{target_bone_id(side, source_id)};
                     const int target_index{
-                        RpHAnimIDGetIndex(binding.hierarchy, target_id)};
+                        RpHAnimIDGetIndex(binding.render_hierarchy, target_id)};
                     const int parent_source{parent_source_id(source_id)};
                     const int parent_id{parent_source == 2
                         ? (side == 0 ? left_hand_id : right_hand_id)
                         : target_bone_id(side, parent_source)};
                     const int parent_index{
-                        RpHAnimIDGetIndex(binding.hierarchy, parent_id)};
+                        RpHAnimIDGetIndex(binding.render_hierarchy, parent_id)};
                     if (target_index < 0 || target_index >= runtime_bone_count ||
                         parent_index < 0 || parent_index >= runtime_bone_count) {
                         break;
@@ -1186,7 +1281,7 @@ private:
         if (ped == nullptr) return;
         for (auto& entry : entries_) {
             if (entry.ped == ped) {
-                entry = {};
+                destroy_entry(entry);
                 return;
             }
         }
@@ -1199,6 +1294,7 @@ private:
     std::array<PedEntry, max_tracked_peds> entries_{};
     std::array<char, MAX_PATH> ini_path_{};
     std::array<char, MAX_PATH> log_path_{};
+    std::array<char, MAX_PATH> fallback_log_path_{};
     std::array<char, MAX_PATH> data_path_{};
 
     inline static HandiesMod* instance_{};

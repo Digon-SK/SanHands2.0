@@ -420,55 +420,35 @@ def make_side_plan(
     if len(removed) < 8:
         raise ValueError(f"Only {len(removed)} {side} hand triangles selected")
 
-    source_to_target_id = {
-        1: config["forearm"],
-        2: config["hand"],
-        3: config["finger"],
-        4: config["finger1"],
-    }
-    for source_id in range(5, 18):
+    source_to_target_id = {1: config["forearm"], 2: config["hand"]}
+    for source_id in range(3, 18):
         candidate = config["id_base"] + source_id
-        while candidate in used_ids:
-            candidate += 100
+        if candidate in used_ids:
+            raise ValueError(f"Runtime-only HAnim ID {candidate} already exists")
         used_ids.add(candidate)
         source_to_target_id[source_id] = candidate
 
     source_to_target_index = {}
-    for source_id in range(1, 5):
+    for source_id in range(1, 3):
         source_to_target_index[source_id] = id_to_bone[source_to_target_id[source_id]].index
 
     new_bones = []
     new_frames = []
-    for source_id in range(5, 18):
+    for source_id in range(3, 18):
         source_bone = template["id_to_bone"][source_id]
         target_id = source_to_target_id[source_id]
         source_to_target_index[source_id] = next_skin_index
         new_bones.append(Bone(target_id, next_skin_index, source_bone.type))
         next_skin_index += 1
 
-    # Source fingers 3 and 4 reuse the two standard GTA finger frames.
+    # All fifteen gang-hand finger nodes stay independent. Their five roots
+    # become children of the ped's native hand frame; the native GTA finger
+    # and finger01 nodes remain completely untouched.
     source_frame_to_target_frame = {
         template["id_to_frame"][1]: id_to_frame[config["forearm"]],
         template["id_to_frame"][2]: id_to_frame[config["hand"]],
-        template["id_to_frame"][3]: id_to_frame[config["finger"]],
-        template["id_to_frame"][4]: id_to_frame[config["finger1"]],
     }
-    for source_id in (3, 4):
-        source_frame = template["clump"].frame_list[template["id_to_frame"][source_id]]
-        target_frame = clump.frame_list[source_frame_to_target_frame[template["id_to_frame"][source_id]]]
-        target_id = source_to_target_id[source_id]
-        target_frame.rotation_matrix = copy.deepcopy(source_frame.rotation_matrix)
-        target_frame.position = Vector(
-            source_frame.position.x * ratio,
-            source_frame.position.y * ratio,
-            source_frame.position.z * ratio,
-        )
-        target_frame.bone_data.header = HAnimHeader(
-            target_frame.bone_data.header.version, target_id, 0
-        )
-
-    # Append the other thirteen frames, preserving the native finger hierarchy.
-    for source_id in range(5, 18):
+    for source_id in range(3, 18):
         source_index = template["id_to_frame"][source_id]
         source_frame = template["clump"].frame_list[source_index]
         target_frame = copy.deepcopy(source_frame)
@@ -488,18 +468,7 @@ def make_side_plan(
         target_frame.parent = source_frame_to_target_frame[parent_source]
         new_frames.append(target_frame)
 
-    replacement_bones = []
-    for source_id in range(3, 18):
-        source_bone = template["id_to_bone"][source_id]
-        replacement_bones.append(
-            Bone(
-                source_to_target_id[source_id],
-                source_to_target_index[source_id],
-                source_bone.type,
-            )
-        )
-
-    # Replace bind matrices for reused finger bones and append matrices for new bones.
+    # Append bind matrices for the complete independent gang-hand hierarchy.
     matrix_updates = {}
     for source_id in range(3, 18):
         source_index = template["id_to_bone"][source_id].index
@@ -518,9 +487,6 @@ def make_side_plan(
         "transform": transform,
         "arm_indices": arm_indices,
         "removed": removed,
-        "replacement_bones": replacement_bones,
-        "replace_start_id": config["finger"],
-        "replace_skip_id": config["finger1"],
         "new_bones": new_bones,
         "new_frames": new_frames,
         "matrix_updates": matrix_updates,
@@ -790,8 +756,8 @@ def process_geometry(clump, geometry_index, templates):
                 template,
                 side,
                 used_ids,
-                skin.num_bones + 13 * len(plans),
-                len(clump.frame_list) + 13 * len(plans),
+                skin.num_bones + 15 * len(plans),
+                len(clump.frame_list) + 15 * len(plans),
             )
         )
 
@@ -807,14 +773,9 @@ def process_geometry(clump, geometry_index, templates):
             else:
                 raise ValueError(f"Non-contiguous skin matrix index {index}")
 
-    replacements = {plan["replace_start_id"]: plan for plan in plans}
-    skip_ids = {plan["replace_skip_id"] for plan in plans}
-    new_root_bones = []
-    for bone in root.bone_data.bones:
-        if bone.id in replacements:
-            new_root_bones.extend(replacements[bone.id]["replacement_bones"])
-        elif bone.id not in skip_ids:
-            new_root_bones.append(bone)
+    new_root_bones = list(root.bone_data.bones)
+    for plan in plans:
+        new_root_bones.extend(plan["new_bones"])
     root.bone_data.bones = new_root_bones
     root.bone_data.header = HAnimHeader(
         root.bone_data.header.version,

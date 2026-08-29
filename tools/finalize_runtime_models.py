@@ -13,9 +13,9 @@ from pathlib import Path
 
 
 MAGIC = b"HND2DAT\0"
-VERSION = 2
+VERSION = 3
 NATIVE_BONES = 32
-RUNTIME_BONES = 58
+RUNTIME_BONES = 62
 FINGER_IDS = tuple(range(3, 18))
 POSE_TIMES = (0.56, 0.6666667, 1.3333333)
 
@@ -201,14 +201,14 @@ def skeleton_for_geometry(clump, geometry_index):
 
 def target_id(side: str, source_id: int) -> int:
     if side == "L":
-        return {3: 35, 4: 36}.get(source_id, 1000 + source_id)
-    return {3: 25, 4: 26}.get(source_id, 1100 + source_id)
+        return 1000 + source_id
+    return 1100 + source_id
 
 
 def make_profile(geometry, clump, geometry_index) -> RuntimeProfile:
     skin = geometry.extensions.get("skin")
     if skin is None or skin.num_bones != RUNTIME_BONES:
-        raise ValueError("Expanded geometry does not have a 58-bone skin")
+        raise ValueError("Expanded geometry does not have a 62-bone skin")
     root, id_to_frame = skeleton_for_geometry(clump, geometry_index)
     translations = []
     for side in ("L", "R"):
@@ -217,9 +217,9 @@ def make_profile(geometry, clump, geometry_index) -> RuntimeProfile:
             translations.append((frame.position.x, frame.position.y, frame.position.z))
 
     if len(root.bone_data.bones) != RUNTIME_BONES:
-        raise ValueError("Expanded HAnim root is not 58 bones")
+        raise ValueError("Expanded HAnim root is not 62 bones")
     if len(skin.bone_matrices) != RUNTIME_BONES:
-        raise ValueError("Expanded skin matrix count is not 58")
+        raise ValueError("Expanded skin matrix count is not 62")
     return RuntimeProfile(
         geometry_hash=fnv1a_vertices(geometry.vertices),
         vertex_count=len(geometry.vertices),
@@ -235,10 +235,10 @@ def make_profile(geometry, clump, geometry_index) -> RuntimeProfile:
 
 def collapsed_bone_index(expanded_index: int, expanded_index_to_id, native_id_to_index):
     bone_id = expanded_index_to_id[expanded_index]
-    if 1005 <= bone_id <= 1017:
-        return native_id_to_index[36 if bone_id == 1005 else 35]
-    if 1105 <= bone_id <= 1117:
-        return native_id_to_index[26 if bone_id == 1105 else 25]
+    if 1003 <= bone_id <= 1017:
+        return native_id_to_index[34]
+    if 1103 <= bone_id <= 1117:
+        return native_id_to_index[24]
     return native_id_to_index[bone_id]
 
 
