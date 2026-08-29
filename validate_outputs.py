@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import math
 import struct
 from pathlib import Path
 
@@ -8,16 +9,25 @@ from dragonff_bootstrap import configure_dragonff
 
 DRAGONFF = configure_dragonff()
 from gtaLib.dff import dff  # noqa: E402
+import add_hands as ah  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--source", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
+parser.add_argument("--hands", type=Path)
 parser.add_argument("--dragonff", type=Path, default=DRAGONFF)
 args = parser.parse_args()
 
 source = args.source
 output = args.output
 expected_new_ids = set(range(1005, 1018)) | set(range(1105, 1118))
+templates = None
+if args.hands:
+    templates = {
+        (variant, side.upper()): ah.load_template(args.hands / f"{variant}hand{side}.dff")
+        for variant in ("f", "s")
+        for side in ("l", "r")
+    }
 
 
 def digest(path):
@@ -65,7 +75,7 @@ for path in dff_paths:
             for frame_index, frame in enumerate(clump.frame_list):
                 if frame.parent >= len(clump.frame_list):
                     errors.append(f"{path.name}: frame {frame_index} has invalid parent")
-            for geo in clump.geometry_list:
+            for geometry_index, geo in enumerate(clump.geometry_list):
                 geometries += 1
                 skin = geo.extensions.get("skin")
                 count = len(geo.vertices)
@@ -82,6 +92,49 @@ for path in dff_paths:
                     errors.append(f"{path.name}: out-of-range skin index")
                 if any(max(tri.a, tri.b, tri.c) >= count for tri in geo.triangles):
                     errors.append(f"{path.name}: out-of-range triangle index")
+                if any(
+                    not math.isfinite(value)
+                    for layer in geo.uv_layers
+                    for uv in layer
+                    for value in (uv.u, uv.v)
+                ):
+                    errors.append(f"{path.name}: non-finite UV coordinate")
+
+                if templates:
+                    _, id_to_frame = ah.skeleton_for_geometry(clump, geometry_index)
+                    selected_templates = []
+                    for side in ("L", "R"):
+                        hand_frame = clump.frame_list[id_to_frame[ah.SIDES[side]["hand"]]]
+                        selected_templates.append(
+                            ah.choose_template(templates, side, ah.vector_length(hand_frame.position))
+                        )
+                    hand_counts = [len(item["geo"].vertices) for item in selected_templates]
+                    original_count = count - sum(hand_counts)
+                    if original_count <= 0:
+                        errors.append(f"{path.name}: cannot locate appended hand ranges")
+                    start = original_count
+                    for side, hand_count in zip(("L", "R"), hand_counts):
+                        hand_range = set(range(start, start + hand_count))
+                        bridge_triangles = [
+                            tri
+                            for tri in geo.triangles
+                            if hand_range.intersection((tri.a, tri.b, tri.c))
+                            and any(index < original_count for index in (tri.a, tri.b, tri.c))
+                        ]
+                        if len(bridge_triangles) < 3:
+                            errors.append(f"{path.name}: {side} wrist is not stitched")
+                        if any(len({tri.a, tri.b, tri.c}) != 3 for tri in bridge_triangles):
+                            errors.append(f"{path.name}: {side} wrist has a degenerate bridge")
+                        hand_materials = {
+                            tri.material
+                            for tri in geo.triangles
+                            if all(index in hand_range for index in (tri.a, tri.b, tri.c))
+                        }
+                        if len(hand_materials) != 1:
+                            errors.append(
+                                f"{path.name}: {side} hand uses {len(hand_materials)} materials"
+                            )
+                        start += hand_count
     except Exception as exc:
         errors.append(f"{path.name}: parse failure: {exc}")
 

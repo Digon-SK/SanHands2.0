@@ -108,6 +108,14 @@ def distance_sq(a, b):
     return dot(d, d)
 
 
+def cross(a, b):
+    return Vector(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    )
+
+
 def closest_barycentric(point, a, b, c):
     # Closest point on a triangle, returning weights for a, b and c.
     ab = sub(b, a)
@@ -165,6 +173,71 @@ def interpolate_color(values, indices, weights):
         value = sum(values[index][field] * weight for index, weight in zip(indices, weights))
         values_out.append(max(0, min(255, round(value))))
     return RGBA(*values_out)
+
+
+def unwrap_uv_axis(values):
+    """Keep a UV island together when it crosses the repeating 0/1 seam."""
+    if len(values) < 2 or max(values) - min(values) <= 0.75:
+        return list(values)
+    wrapped = sorted(value % 1.0 for value in values)
+    gaps = [
+        ((wrapped[(index + 1) % len(wrapped)] - wrapped[index]) % 1.0, index)
+        for index in range(len(wrapped))
+    ]
+    _, gap_index = max(gaps)
+    start = wrapped[(gap_index + 1) % len(wrapped)]
+    unwrapped = [value % 1.0 + (1.0 if value % 1.0 < start else 0.0) for value in values]
+    if max(unwrapped) - min(unwrapped) >= max(values) - min(values):
+        return list(values)
+    raw_center = (min(values) + max(values)) * 0.5
+    new_center = (min(unwrapped) + max(unwrapped)) * 0.5
+    tile = round(raw_center - new_center)
+    return [value + tile for value in unwrapped]
+
+
+def percentile(values, fraction):
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    amount = position - lower
+    return ordered[lower] * (1.0 - amount) + ordered[upper] * amount
+
+
+def remap_uv_island(source_layer, target_samples):
+    """Affine-map the complete source hand island into the old hand's skin island."""
+    source_u = unwrap_uv_axis([uv.u for uv in source_layer])
+    source_v = unwrap_uv_axis([uv.v for uv in source_layer])
+    target_u = unwrap_uv_axis([uv.u for uv in target_samples])
+    target_v = unwrap_uv_axis([uv.v for uv in target_samples])
+
+    def map_axis(values, source_values, target_values):
+        source_min, source_max = min(source_values), max(source_values)
+        target_min = percentile(target_values, 0.10)
+        target_max = percentile(target_values, 0.90)
+        padding = (target_max - target_min) * 0.075
+        target_min -= padding
+        target_max += padding
+        if source_max - source_min < 1e-8:
+            return [(target_min + target_max) * 0.5 for _ in values]
+        return [
+            target_min
+            + (value - source_min) / (source_max - source_min) * (target_max - target_min)
+            for value in values
+        ]
+
+    mapped_u = map_axis(source_u, source_u, target_u)
+    mapped_v = map_axis(source_v, source_v, target_v)
+    return [TexCoords(u, v) for u, v in zip(mapped_u, mapped_v)]
+
+
+def uv_triangle_center(layer, triangle):
+    indices = (triangle.a, triangle.b, triangle.c)
+    values_u = unwrap_uv_axis([layer[index].u for index in indices])
+    values_v = unwrap_uv_axis([layer[index].v for index in indices])
+    return TexCoords(sum(values_u) / 3.0, sum(values_v) / 3.0)
 
 
 def recompute_sphere(vertices):
@@ -308,6 +381,7 @@ def make_side_plan(
         id_to_bone[config["finger"]].index,
         id_to_bone[config["finger1"]].index,
     }
+    arm_indices = hand_indices | {target_forearm_index}
     hand_weights = [
         sum(weight for bone_index, weight in zip(bone_indices, weights) if bone_index in hand_indices)
         for bone_indices, weights in zip(skin.vertex_bone_indices, skin.vertex_bone_weights)
@@ -324,7 +398,6 @@ def make_side_plan(
     # the complete arm influence. The centroid test preserves every triangle
     # crossing back into the forearm instead of opening the old wrist gap.
     if len(removed) < 8:
-        arm_indices = hand_indices | {target_forearm_index}
         arm_weights = [
             sum(
                 weight
@@ -443,6 +516,7 @@ def make_side_plan(
         "template": template,
         "ratio": ratio,
         "transform": transform,
+        "arm_indices": arm_indices,
         "removed": removed,
         "replacement_bones": replacement_bones,
         "replace_start_id": config["finger"],
@@ -452,6 +526,136 @@ def make_side_plan(
         "matrix_updates": matrix_updates,
         "skin_index_map": skin_index_map,
     }
+
+
+def unique_positions(items, vertices, tolerance_sq=1e-8):
+    result = []
+    for index in items:
+        if not any(distance_sq(vertices[index], vertices[other]) <= tolerance_sq for other in result):
+            result.append(index)
+    return result
+
+
+def target_wrist_ring(plan, old_vertices, old_indices, old_weights, used_old):
+    source_vertices = plan["template"]["geo"].vertices
+    source_min_x = min(vertex.x for vertex in source_vertices)
+    inverse_transform = inverse(plan["transform"])
+    removed_indices = {
+        index for tri in plan["removed"] for index in (tri.a, tri.b, tri.c)
+    }
+    boundary = []
+    # Most models expose their wrist contour very close to the template plane.
+    # A few beta/custom peds have a much longer hand offset, so widen the search
+    # only when the tight contour does not contain a usable ring.
+    for window in (0.08, 0.18):
+        candidates = []
+        for index in used_old:
+            arm_weight = sum(
+                weight
+                for bone_index, weight in zip(old_indices[index], old_weights[index])
+                if bone_index in plan["arm_indices"]
+            )
+            local = mat_vec(inverse_transform, old_vertices[index])
+            if arm_weight > 0.20 and abs(local.x - source_min_x) <= window:
+                candidates.append(index)
+        boundary = [
+            index
+            for index in candidates
+            if min(
+                distance_sq(old_vertices[index], old_vertices[removed_index])
+                for removed_index in removed_indices
+            )
+            <= 1e-8
+        ]
+        boundary = unique_positions(boundary, old_vertices)
+        if len(boundary) >= 3:
+            break
+    if len(boundary) < 3:
+        raise ValueError(f"Only {len(boundary)} unique {plan['side']} wrist boundary vertices")
+    return boundary
+
+
+def order_ring(indices, vertices, transform=None):
+    points = [mat_vec(transform, vertices[index]) if transform else vertices[index] for index in indices]
+    center_y = sum(point.y for point in points) / len(points)
+    center_z = sum(point.z for point in points) / len(points)
+    ordered = sorted(
+        zip(indices, points),
+        key=lambda item: math.atan2(item[1].z - center_z, item[1].y - center_y),
+    )
+    return [index for index, _ in ordered], center_y, center_z
+
+
+def append_wrist_bridge(geo, plan, source_output_indices, target_output_indices, material):
+    inverse_transform = inverse(plan["transform"])
+    source_order, source_center_y, source_center_z = order_ring(
+        source_output_indices,
+        geo.vertices,
+        inverse_transform,
+    )
+    target_order, target_center_y, target_center_z = order_ring(
+        target_output_indices,
+        geo.vertices,
+        inverse_transform,
+    )
+    center_y = (source_center_y + target_center_y) * 0.5
+    center_z = (source_center_z + target_center_z) * 0.5
+
+    def angle(index):
+        point = mat_vec(inverse_transform, geo.vertices[index])
+        return math.atan2(point.z - center_z, point.y - center_y) % (2.0 * math.pi)
+
+    # Start both loops at the source point nearest angle zero, then walk them
+    # together. Advancing the loop whose next polar angle comes first creates a
+    # closed zipper even when the original wrist has fewer vertices.
+    offset = min(angle(index) for index in source_order)
+
+    def with_relative_angles(indices):
+        rows = [(((angle(index) - offset) % (2.0 * math.pi)), index) for index in indices]
+        rows.sort()
+        return rows
+
+    source_rows = with_relative_angles(source_order)
+    target_rows = with_relative_angles(target_order)
+    source_order = [index for _, index in source_rows]
+    target_order = [index for _, index in target_rows]
+    source_angles = [value for value, _ in source_rows]
+    target_angles = [value for value, _ in target_rows]
+    source_count, target_count = len(source_order), len(target_order)
+    i = j = 0
+
+    def add_outward_triangle(a, b, c):
+        pa = mat_vec(inverse_transform, geo.vertices[a])
+        pb = mat_vec(inverse_transform, geo.vertices[b])
+        pc = mat_vec(inverse_transform, geo.vertices[c])
+        normal = cross(sub(pb, pa), sub(pc, pa))
+        radial = Vector(
+            0.0,
+            (pa.y + pb.y + pc.y) / 3.0 - center_y,
+            (pa.z + pb.z + pc.z) / 3.0 - center_z,
+        )
+        if dot(normal, radial) < 0.0:
+            b, c = c, b
+        # DragonFF's Triangle tuple is stored as (b, a, material, c).
+        geo.triangles.append(Triangle(b, a, material, c))
+
+    while i < source_count or j < target_count:
+        current_source = source_order[i % source_count]
+        current_target = target_order[j % target_count]
+        next_source_angle = (
+            source_angles[i + 1] if i + 1 < source_count else source_angles[0] + 2.0 * math.pi
+        )
+        next_target_angle = (
+            target_angles[j + 1] if j + 1 < target_count else target_angles[0] + 2.0 * math.pi
+        )
+        if i < source_count and (j >= target_count or next_source_angle <= next_target_angle):
+            next_source = source_order[(i + 1) % source_count]
+            add_outward_triangle(current_source, next_source, current_target)
+            i += 1
+        else:
+            next_target = target_order[(j + 1) % target_count]
+            add_outward_triangle(current_source, next_target, current_target)
+            j += 1
 
 
 def rebuild_geometry(geo, skin, plans):
@@ -487,6 +691,8 @@ def rebuild_geometry(geo, skin, plans):
         source_geo = plan["template"]["geo"]
         source_skin = plan["template"]["skin"]
         base = len(geo.vertices)
+        material = Counter(tri.material for tri in plan["removed"]).most_common(1)[0][0]
+        material_triangles = [tri for tri in plan["removed"] if tri.material == material]
         nearest = []
         for source_vertex in source_geo.vertices:
             transformed = mat_vec(plan["transform"], source_vertex)
@@ -498,8 +704,20 @@ def rebuild_geometry(geo, skin, plans):
                 geo.normals.append(normalize(mat_vec(plan["transform"], source_normal, 0.0)))
 
         for layer_index, old_layer in enumerate(old_uv_layers):
-            for _, indices, weights in nearest:
-                geo.uv_layers[layer_index].append(interpolate(old_layer, indices, weights, TexCoords))
+            if source_geo.uv_layers:
+                source_layer = source_geo.uv_layers[min(layer_index, len(source_geo.uv_layers) - 1)]
+                target_samples = [
+                    uv_triangle_center(old_layer, tri)
+                    for tri in material_triangles
+                ]
+                geo.uv_layers[layer_index].extend(
+                    remap_uv_island(source_layer, target_samples)
+                )
+            else:
+                for _, indices, weights in nearest:
+                    geo.uv_layers[layer_index].append(
+                        interpolate(old_layer, indices, weights, TexCoords)
+                    )
 
         if old_prelit:
             for _, indices, weights in nearest:
@@ -517,11 +735,7 @@ def rebuild_geometry(geo, skin, plans):
             )
             skin.vertex_bone_weights.append(tuple(source_weights))
 
-        vertex_materials = [item[0].material for item in nearest]
         for source_tri in source_geo.triangles:
-            material = Counter(
-                vertex_materials[index] for index in (source_tri.a, source_tri.b, source_tri.c)
-            ).most_common(1)[0][0]
             geo.triangles.append(
                 Triangle(
                     source_tri.b + base,
@@ -530,6 +744,24 @@ def rebuild_geometry(geo, skin, plans):
                     source_tri.c + base,
                 )
             )
+
+        source_min_x = min(vertex.x for vertex in source_geo.vertices)
+        source_wrist = [
+            base + index
+            for index, vertex in enumerate(source_geo.vertices)
+            if vertex.x <= source_min_x + 0.011
+        ]
+        target_wrist = [
+            remap[index]
+            for index in target_wrist_ring(
+                plan,
+                old_vertices,
+                old_indices,
+                old_weights,
+                used_old,
+            )
+        ]
+        append_wrist_bridge(geo, plan, source_wrist, target_wrist, material)
 
     geo.bounding_sphere = recompute_sphere(geo.vertices)
     geo.extensions.pop("mat_split", None)

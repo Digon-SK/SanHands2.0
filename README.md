@@ -2,11 +2,13 @@
 
 Batch conversion tool for GTA San Andreas pedestrian DFF models. It removes the original closed hand mesh at each wrist, inserts Rockstar's articulated `fhandl`/`fhandr` or `shandl`/`shandr` geometry, and extends the pedestrian skin with weighted finger bones.
 
-The converter selects the small or standard native hand according to each skeleton's proportions. UV coordinates and material assignments are transferred from the original hand surface so every pedestrian continues using its own TXD.
+The converter selects the small or standard native hand according to each skeleton's proportions. It stitches the detailed eight-vertex wrist loop to the original low-poly forearm contour, even when the two loops have different vertex counts. The native hand UV island is remapped coherently into the pedestrian's dominant skin region so the fingers do not sample unrelated parts of the texture.
 
 ## What it changes
 
 - Replaces both original hand meshes at the wrist.
+- Closes the wrist with shared bridge triangles instead of leaving overlapping open edges.
+- Preserves the detailed hand's UV topology and assigns one dominant skin material per hand.
 - Preserves the standard forearm, hand, and two GTA finger bone IDs.
 - Adds 13 additional weighted finger bones per hand.
 - Produces a 58-bone skin for conventional pedestrians.
@@ -43,8 +45,11 @@ To validate a completed batch independently:
 python validate_outputs.py `
   --dragonff "C:\tools\DragonFF-master" `
   --source "C:\path\to\peds" `
+  --hands "C:\path\to\hands" `
   --output "C:\path\to\peds-with-hands"
 ```
+
+Passing `--hands` enables additional checks for closed wrist bridges, finite UVs, and a single material on each replacement hand.
 
 Diagnostic helpers are also included:
 
