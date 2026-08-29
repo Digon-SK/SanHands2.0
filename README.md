@@ -17,6 +17,40 @@ The converter selects the small or standard native hand according to each skelet
 
 `player.dff` is copied unchanged. CJ uses a modular body assembled from `player.img`, and the base DFF has no conventional hand surface to replace.
 
+## Handies ASI
+
+`src/Handies.cpp` animates the added finger bones inside each converted ped. It
+does not create replacement `CHandObject` instances and does not hide the ped's
+embedded hands.
+
+GTA builds its standard animation associations against the original 32-node
+`male01` skeleton. When those associations are copied to a converted 58-node
+ped, the original game keeps a 32-element blend-node array while its update loop
+walks all 58 frames. `Handies.asi` intercepts that update call and rebuilds any
+mismatched association against the actual clump, letting the game's own
+bone-tag lookup remap body tracks without changing their animations.
+
+The plugin loads `Handies.ifp` as two partial animations. These contain only the
+15 finger tracks for each side, remapped to the IDs emitted by `add_hands.py`.
+The original wrist, arm, body, weapon, and ragdoll transforms therefore continue
+to come from GTA and other animation mods.
+
+Build and install the complete local mod with:
+
+```powershell
+.\build_handies.ps1
+```
+
+Defaults target GTA SA 1.0 US, MinGW 32-bit at `C:\msys64\mingw32`, plugin-sdk
+at `C:\Users\Digon\Documents\Fuentes\plugin-sdk-master`, and installation at
+`C:\juegos\Grand Theft Auto San Andreas\modloader\Handies`. The generated IFP
+is derived locally from `SanHands\dist\handpose.ifp`; no game animation assets
+are committed to this repository.
+
+Disable the older `SanHands.asi` while using Handies. The older plugin creates
+separate hand objects by design, so loading both implementations would display
+duplicate systems.
+
 ## Requirements
 
 - Python 3.10 or newer.
