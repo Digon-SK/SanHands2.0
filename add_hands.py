@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import shutil
 from collections import Counter
@@ -298,6 +299,14 @@ def choose_template(templates, side, target_length):
     return min(candidates, key=lambda item: abs(item["hand_length"] - target_length))
 
 
+def morph_vertices(template):
+    return [Vector(*value) for value in template["morph"].target("Relaxed").positions]
+
+
+def morph_normals(template):
+    return [Vector(*value) for value in template["morph"].target("Relaxed").normals]
+
+
 def skeleton_for_geometry(clump, geometry_index):
     atomic = next((item for item in clump.atomic_list if item.geometry == geometry_index), None)
     if atomic is None:
@@ -371,7 +380,7 @@ def make_side_plan(
     inverse_forearm = inverse(target_forearm_global)
 
     source_geo = template["geo"]
-    cut = min(vertex.x for vertex in source_geo.vertices) * ratio
+    cut = min(vertex.x for vertex in morph_vertices(template)) * ratio
     # Select only the original hand surface. Including forearm weights here can
     # remove a complete low-poly wrist triangle and leave a visible gap. A
     # triangle must have meaningful hand/finger influence and its centroid must
@@ -503,7 +512,7 @@ def unique_positions(items, vertices, tolerance_sq=1e-8):
 
 
 def target_wrist_ring(plan, old_vertices, old_indices, old_weights, used_old):
-    source_vertices = plan["template"]["geo"].vertices
+    source_vertices = morph_vertices(plan["template"])
     source_min_x = min(vertex.x for vertex in source_vertices)
     inverse_transform = inverse(plan["transform"])
     removed_indices = {
@@ -655,18 +664,22 @@ def rebuild_geometry(geo, skin, plans):
 
     for plan in plans:
         source_geo = plan["template"]["geo"]
+        source_vertices = morph_vertices(plan["template"])
+        source_normals = morph_normals(plan["template"])
         source_skin = plan["template"]["skin"]
         base = len(geo.vertices)
+        plan["output_start"] = base
+        plan["output_count"] = len(source_vertices)
         material = Counter(tri.material for tri in plan["removed"]).most_common(1)[0][0]
         material_triangles = [tri for tri in plan["removed"] if tri.material == material]
         nearest = []
-        for source_vertex in source_geo.vertices:
+        for source_vertex in source_vertices:
             transformed = mat_vec(plan["transform"], source_vertex)
             geo.vertices.append(transformed)
             nearest.append(nearest_surface_data(transformed, plan["removed"], old_vertices))
 
         if old_normals:
-            for source_normal in source_geo.normals:
+            for source_normal in source_normals:
                 geo.normals.append(normalize(mat_vec(plan["transform"], source_normal, 0.0)))
 
         for layer_index, old_layer in enumerate(old_uv_layers):
@@ -711,10 +724,10 @@ def rebuild_geometry(geo, skin, plans):
                 )
             )
 
-        source_min_x = min(vertex.x for vertex in source_geo.vertices)
+        source_min_x = min(vertex.x for vertex in source_vertices)
         source_wrist = [
             base + index
-            for index, vertex in enumerate(source_geo.vertices)
+            for index, vertex in enumerate(source_vertices)
             if vertex.x <= source_min_x + 0.011
         ]
         target_wrist = [
@@ -794,6 +807,16 @@ def process_geometry(clump, geometry_index, templates):
         "triangles": len(geo.triangles),
         "bones": skin.num_bones,
         "matrices": len(skin.bone_matrices),
+        "hands": [
+            {
+                "side": plan["side"],
+                "start": plan["output_start"],
+                "count": plan["output_count"],
+                "template": plan["template"]["morph"].name,
+                "transform": plan["transform"],
+            }
+            for plan in plans
+        ],
     }
 
 
@@ -862,16 +885,32 @@ def main():
     parser.add_argument("--dragonff", type=Path, default=DRAGONFF)
     parser.add_argument("--one", help="Process only one DFF filename")
     parser.add_argument("--copy-txd", action="store_true")
+    parser.add_argument("--blendshapes", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
     args = parser.parse_args()
 
+    from tools.blendshape_profiles import load_profiles
+
+    morph_profiles = {profile.name.casefold(): profile for profile in load_profiles(args.blendshapes)}
     templates = {}
     for variant in ("f", "s"):
         for side in ("l", "r"):
-            templates[(variant, side.upper())] = load_template(args.hands / f"{variant}hand{side}.dff")
+            template = load_template(args.hands / f"{variant}hand{side}.dff")
+            morph_name = (
+                ("Fat" if variant == "f" else "Slim")
+                + "_"
+                + ("Left" if side == "l" else "Right")
+            )
+            morph = morph_profiles.get(morph_name.casefold())
+            if morph is None or morph.vertex_count != len(template["geo"].vertices):
+                raise ValueError(f"Invalid blendshape template {morph_name}")
+            template["morph"] = morph
+            templates[(variant, side.upper())] = template
 
     paths = [args.input / args.one] if args.one else sorted(args.input.glob("*.dff"))
     failures = []
     unchanged = []
+    manifest = {"version": 1, "files": {}}
     for index, input_path in enumerate(paths, 1):
         try:
             output_path = args.output / input_path.name
@@ -886,6 +925,7 @@ def main():
                 )
                 continue
             reports = process_file(input_path, output_path, templates)
+            manifest["files"][input_path.name.casefold()] = reports
             validate_file(output_path)
             details = "; ".join(
                 f"g{r['geometry']} rm={r['removed_left']}/{r['removed_right']} "
@@ -900,6 +940,9 @@ def main():
     if args.copy_txd and not args.one:
         for path in args.input.glob("*.txd"):
             shutil.copy2(path, args.output / path.name)
+
+    args.manifest.parent.mkdir(parents=True, exist_ok=True)
+    args.manifest.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
 
     modified = len(paths) - len(failures) - len(unchanged)
     print(

@@ -11,8 +11,9 @@ The generated DFFs contain the replacement hand geometry, closed wrist seams, co
 - Preserves the detailed hand UV topology and maps it into the ped's dominant skin region.
 - Restores the original 32-node HAnim hierarchy and 32-bone Skin PLG before writing each final DFF.
 - Keeps GTA's normal walk, fight, weapon, gesture, and body animation associations at 32 frames.
-- Builds a geometry-specific hand profile containing its finger vertex mask, gang-hand weights, bind matrices, offsets, and base normals.
-- Imports every animation in `ghands.ifp` that contains the complete 15-track finger rig as a named hand sequence.
+- Imports the edited `Handies_Blendshape_Profiles.glb` as the authoritative Basis and named hand shapes, rebuilding the original DFF topology from UV and position correspondence when glTF splits vertices.
+- Builds geometry-specific hand ranges and transforms plus shared vertex/normal morph targets for the four slim/fat and left/right variants.
+- Converts every matching animation in `ghands.ifp` into a scalar timeline that drives its same-named GLB shape.
 - Selects those sequences through configurable hand profiles mapped to live ped animation associations.
 - Applies the selected morph to the shared hand vertices immediately before `RpClumpRender`, renders through the untouched native 32-bone Skin, and restores the base vertices immediately afterward.
 - Never creates a 62-node runtime hierarchy, swaps HAnim owners, or changes `CAnimBlendClumpData`, `finger`, or `finger01`.
@@ -26,11 +27,11 @@ The generated DFFs contain the replacement hand geometry, closed wrist seams, co
 The installed mod consists of:
 
 - `Handies.asi`: render-time hand-profile blending and finger animation.
-- `Handies.dat`: geometry-specific morph masks plus all named finger sequences sampled from the hand IFP.
+- `Handies.dat`: edited GLB positions/normals, geometry-specific hand ranges/transforms, and the timelines derived from the hand IFP.
 - `Handies.ini`: enable/player/NPC settings, hand-sequence profiles, and ped-animation mappings.
 - Final DFF/TXD files: hand geometry with the native skeleton only.
 
-The source IFP remains `modloader\hands\ghands.ifp`; Handies does not register a second animation block in GTA. During the build, each complete finger animation is compiled into `Handies.dat` under its original IFP name. Changing only profile mappings does not require rebuilding; adding or editing an IFP sequence does.
+The source IFP remains `modloader\hands\ghands.ifp`; Handies does not register a second animation block in GTA. During the build, each complete finger animation whose name matches a GLB shape is compiled into `Handies.dat`. Changing only profile mappings does not require rebuilding; editing the GLB or IFP does.
 
 ## Hand sequence profiles
 
@@ -79,12 +80,14 @@ The defaults use:
 - plugin-sdk: `C:\Users\Digon\Documents\Fuentes\plugin-sdk-master`
 - pose source: `C:\Users\Digon\Documents\ChatGPT\SanHands\dist\handpose.ifp`
 - gang-sign source used by the installed mod: `C:\juegos\Grand Theft Auto San Andreas\modloader\hands\ghands.ifp`
+- edited blendshape source: `C:\Users\Digon\Desktop\Handies_Blendshape_Profiles.glb`
+- Blender: `C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe`
 - Original peds: `C:\Users\Digon\Desktop\peds`
 - Native articulated hands: `C:\Users\Digon\Desktop\hands`
 - Final models: `C:\Users\Digon\Desktop\peds\con manos`
 - Installation: `C:\juegos\Grand Theft Auto San Andreas\modloader\Handies`
 
-The script performs the complete pipeline: temporary authoring conversion, restoration of every native skeleton, structural validation, 32-bit ASI compilation, and installation.
+The script extracts and validates the edited GLB, performs the temporary authoring conversion, restores every native skeleton, validates the complete output, compiles the 32-bit ASI, and installs it.
 
 ## Editable blendshape GLB
 
@@ -96,7 +99,7 @@ The four source-hand variants and their editable profiles can be exported with B
   --output "C:\path\to\Handies_Blendshape_Profiles.glb"
 ```
 
-The GLB contains `Slim_Left`, `Slim_Right`, `Fat_Left`, and `Fat_Right`. Its basis is the `Relaxed` runtime profile; the morph targets are `Grip`, right-hand `FuckU`, and the five matching `LHGsign` or `RHGsign` profiles sampled from the sustained part of their IFP sequences. UV coordinates and original template topology are preserved. `tools\validate_blendshape_glb.py` reimports the file in a clean Blender scene and checks all objects, vertex counts, UV layers, and non-empty shape keys.
+The GLB contains `Slim_Left`, `Slim_Right`, `Fat_Left`, and `Fat_Right`. Its basis is the `Relaxed` runtime profile; the morph targets are `Grip`, right-hand `FuckU`, and the five matching `LHGsign` or `RHGsign` profiles sampled from the sustained part of their IFP sequences. `tools\extract_blendshape_profiles.py` accepts ordinary glTF vertex splitting, ignores unrelated scene objects, reconstructs the original source topology, and writes the runtime-ready profiles. UV coordinates and the editable shape keys are preserved.
 
 ## Manual geometry conversion
 
@@ -108,6 +111,8 @@ python add_hands.py `
   --input "C:\path\to\peds" `
   --hands "C:\path\to\hands" `
   --output "C:\path\to\temporary-expanded" `
+  --blendshapes "C:\path\to\BlendshapeProfiles.dat" `
+  --manifest "C:\path\to\expanded-manifest.json" `
   --copy-txd
 ```
 

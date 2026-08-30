@@ -205,9 +205,47 @@ try:
     if len(data) < 16 or data[:8] != b"HND2DAT\0":
         raise ValueError("invalid magic")
     version, profile_count = struct.unpack_from("<II", data, 8)
-    if version != 4:
+    if version != 5:
         raise ValueError(f"unsupported version {version}")
-    offset = 16 + 2 * 3 * 15 * 16
+    offset = 16
+    (template_count,) = struct.unpack_from("<I", data, offset)
+    offset += 4
+    if template_count != 4:
+        raise ValueError(f"invalid blendshape template count {template_count}")
+    template_vertex_counts = []
+    template_targets = []
+    for _template in range(template_count):
+        name_length, vertex_count, target_count = struct.unpack_from(
+            "<III", data, offset
+        )
+        offset += 12
+        if name_length == 0 or name_length > 63:
+            raise ValueError(f"invalid template name length {name_length}")
+        name = data[offset : offset + name_length].decode("ascii")
+        offset += name_length
+        if vertex_count == 0 or vertex_count > 10000:
+            raise ValueError(f"{name}: invalid vertex count {vertex_count}")
+        if target_count == 0 or target_count > 32:
+            raise ValueError(f"{name}: invalid target count {target_count}")
+        names = set()
+        for _target in range(target_count):
+            (target_name_length,) = struct.unpack_from("<I", data, offset)
+            offset += 4
+            if target_name_length == 0 or target_name_length > 63:
+                raise ValueError(f"{name}: invalid target name length")
+            target_name = data[offset : offset + target_name_length].decode("ascii")
+            offset += target_name_length
+            if target_name.casefold() in names:
+                raise ValueError(f"{name}: duplicate target {target_name}")
+            names.add(target_name.casefold())
+            values = struct.unpack_from(f"<{vertex_count * 6}f", data, offset)
+            offset += vertex_count * 24
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError(f"{name}/{target_name}: non-finite morph data")
+        if "grip" not in names:
+            raise ValueError(f"{name}: missing Grip target")
+        template_vertex_counts.append(vertex_count)
+        template_targets.append(names)
     (hand_animation_count,) = struct.unpack_from("<I", data, offset)
     offset += 4
     if hand_animation_count == 0 or hand_animation_count > 256:
@@ -223,34 +261,39 @@ try:
         if name.casefold() in animation_names:
             raise ValueError(f"duplicate hand animation {name}")
         animation_names.add(name.casefold())
-        (duration,) = struct.unpack_from("<f", data, offset)
-        offset += 4
+        duration, key_count = struct.unpack_from("<fI", data, offset)
+        offset += 8
         if duration <= 0.0 or duration > 30.0:
             raise ValueError(f"invalid hand-animation duration {duration}")
-        for _bone in range(15):
-            (key_count,) = struct.unpack_from("<I", data, offset)
-            offset += 4
-            if key_count == 0 or key_count > 64:
-                raise ValueError(f"invalid hand-animation key count {key_count}")
-            previous_time = -1.0
-            for _key in range(key_count):
-                time, x, y, z, w = struct.unpack_from("<5f", data, offset)
-                offset += 20
-                if time < previous_time or time < 0.0 or time > duration + 1.0e-4:
-                    raise ValueError(f"invalid hand-animation key time {time}")
-                length = math.sqrt(x * x + y * y + z * z + w * w)
-                if abs(length - 1.0) > 1.0e-3:
-                    raise ValueError("non-normalized hand-animation quaternion")
-                previous_time = time
+        if key_count == 0 or key_count > 256:
+            raise ValueError(f"invalid hand-animation key count {key_count}")
+        previous_time = -1.0
+        for _key in range(key_count):
+            time, weight = struct.unpack_from("<2f", data, offset)
+            offset += 8
+            if time < previous_time or time < 0.0 or time > duration + 1.0e-4:
+                raise ValueError(f"invalid hand-animation key time {time}")
+            if not math.isfinite(weight) or weight < 0.0 or weight > 1.0:
+                raise ValueError(f"invalid hand-animation weight {weight}")
+            previous_time = time
     data_profiles = set()
     for _ in range(profile_count):
-        geometry_hash, vertex_count, bone_count = struct.unpack_from(
-            "<QII", data, offset
-        )
-        if bone_count != 62:
-            raise ValueError(f"runtime profile has {bone_count} bones")
+        geometry_hash, vertex_count = struct.unpack_from("<QI", data, offset)
+        offset += 12
         data_profiles.add((geometry_hash, vertex_count))
-        offset += 16 + 30 * 12 + vertex_count * 4 + vertex_count * 16 + 62 * 64
+        for side in range(2):
+            start, count, template_index = struct.unpack_from("<III", data, offset)
+            offset += 12
+            matrix = struct.unpack_from("<16f", data, offset)
+            offset += 64
+            if template_index >= template_count:
+                raise ValueError(f"profile template index {template_index} is invalid")
+            if count != template_vertex_counts[template_index]:
+                raise ValueError("profile/template vertex count mismatch")
+            if start > vertex_count or count > vertex_count - start:
+                raise ValueError("profile hand range is out of bounds")
+            if not all(math.isfinite(value) for value in matrix):
+                raise ValueError("profile contains a non-finite transform")
     if offset != len(data):
         raise ValueError(f"trailing/truncated bytes: parsed {offset}, file {len(data)}")
     if data_profiles != geometry_profiles:

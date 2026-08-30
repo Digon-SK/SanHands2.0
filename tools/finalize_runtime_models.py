@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import struct
 import sys
@@ -13,21 +14,36 @@ from pathlib import Path
 
 
 MAGIC = b"HND2DAT\0"
-VERSION = 4
+VERSION = 5
 NATIVE_BONES = 32
 RUNTIME_BONES = 62
 FINGER_IDS = tuple(range(3, 18))
-POSE_TIMES = (0.56, 0.6666667, 1.3333333)
-
-
 @dataclass(frozen=True)
 class RuntimeProfile:
     geometry_hash: int
     vertex_count: int
-    translations: tuple[tuple[float, float, float], ...]
-    indices: tuple[tuple[int, int, int, int], ...]
-    weights: tuple[tuple[float, float, float, float], ...]
-    matrices: tuple[tuple[tuple[float, float, float, float], ...], ...]
+    hands: tuple["RuntimeHand", "RuntimeHand"]
+
+
+@dataclass(frozen=True)
+class RuntimeHand:
+    start: int
+    count: int
+    template_index: int
+    transform: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class MorphWeightKey:
+    time: float
+    weight: float
+
+
+@dataclass(frozen=True)
+class MorphAnimation:
+    name: str
+    duration: float
+    keys: tuple[MorphWeightKey, ...]
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gang-source", required=True, type=Path)
     parser.add_argument("--dragonff", required=True, type=Path)
     parser.add_argument("--rwfury-root", required=True, type=Path)
+    parser.add_argument("--blendshapes", required=True, type=Path)
+    parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--one", help="Process only one DFF filename")
     return parser.parse_args()
 
@@ -84,6 +102,9 @@ def sample_rotation(obj, time):
                 tuple(first.rotation), tuple(second.rotation), amount
             )
     raise AssertionError("unreachable quaternion sample")
+
+
+POSE_TIMES = (0.56, 0.6666667, 1.3333333)
 
 
 def load_pose_table(pose_source: Path, rwfury_root: Path):
@@ -154,6 +175,52 @@ def load_hand_animation_table(gang_source: Path, rwfury_root: Path):
     return tuple(result)
 
 
+def sample_key_track(keys, time):
+    if time <= keys[0][0]:
+        return keys[0][1]
+    if time >= keys[-1][0]:
+        return keys[-1][1]
+    for first, second in zip(keys, keys[1:]):
+        if first[0] <= time <= second[0]:
+            span = second[0] - first[0]
+            amount = 0.0 if span <= 1.0e-12 else (time - first[0]) / span
+            return interpolate_quaternion(first[1], second[1], amount)
+    raise AssertionError("unreachable key track")
+
+
+def aligned_quaternion(value, reference):
+    return tuple(-item for item in value) if sum(
+        item * other for item, other in zip(value, reference)
+    ) < 0.0 else value
+
+
+def make_morph_animations(hand_animations, available_targets, sample_time=1.0):
+    result = []
+    for name, duration, tracks in hand_animations:
+        if name.casefold() not in available_targets:
+            continue
+        times = sorted({time for track in tracks for time, _ in track})
+        starts = [track[0][1] for track in tracks]
+        targets = [sample_key_track(track, sample_time) for track in tracks]
+        keys = []
+        for time in times:
+            numerator = 0.0
+            denominator = 0.0
+            for track, start, target in zip(tracks, starts, targets):
+                target = aligned_quaternion(target, start)
+                current = aligned_quaternion(sample_key_track(track, time), start)
+                direction = tuple(b - a for a, b in zip(start, target))
+                delta = tuple(value - base for value, base in zip(current, start))
+                numerator += sum(value * axis for value, axis in zip(delta, direction))
+                denominator += sum(axis * axis for axis in direction)
+            weight = 0.0 if denominator <= 1.0e-12 else numerator / denominator
+            keys.append(MorphWeightKey(float(time), min(max(weight, 0.0), 1.0)))
+        result.append(MorphAnimation(name, duration, tuple(keys)))
+    if not result:
+        raise ValueError("No IFP animations match blendshape targets")
+    return tuple(result)
+
+
 def descendants(frames, root_index):
     result = []
     pending = [root_index]
@@ -203,37 +270,41 @@ def skeleton_for_geometry(clump, geometry_index):
     return clump.frame_list[root_index], id_to_frame
 
 
-def target_id(side: str, source_id: int) -> int:
-    if side == "L":
-        return 1000 + source_id
-    return 1100 + source_id
+def rw_matrix_values(matrix) -> tuple[float, ...]:
+    return (
+        matrix[0][0], matrix[1][0], matrix[2][0], 0.0,
+        matrix[0][1], matrix[1][1], matrix[2][1], 0.0,
+        matrix[0][2], matrix[1][2], matrix[2][2], 0.0,
+        matrix[0][3], matrix[1][3], matrix[2][3], 1.0,
+    )
 
 
-def make_profile(geometry, clump, geometry_index) -> RuntimeProfile:
+def make_profile(geometry, report, template_indices, templates) -> RuntimeProfile:
     skin = geometry.extensions.get("skin")
     if skin is None or skin.num_bones != RUNTIME_BONES:
         raise ValueError("Expanded geometry does not have a 62-bone skin")
-    root, id_to_frame = skeleton_for_geometry(clump, geometry_index)
-    translations = []
-    for side in ("L", "R"):
-        for source_id in FINGER_IDS:
-            frame = id_to_frame[target_id(side, source_id)]
-            translations.append((frame.position.x, frame.position.y, frame.position.z))
-
-    if len(root.bone_data.bones) != RUNTIME_BONES:
-        raise ValueError("Expanded HAnim root is not 62 bones")
     if len(skin.bone_matrices) != RUNTIME_BONES:
         raise ValueError("Expanded skin matrix count is not 62")
+    hands = []
+    for expected_side, hand in zip(("L", "R"), report["hands"]):
+        if hand["side"] != expected_side:
+            raise ValueError("Blendshape hand manifest side mismatch")
+        template_index = template_indices[hand["template"].casefold()]
+        template = templates[template_index]
+        start = int(hand["start"])
+        count = int(hand["count"])
+        if count != template.vertex_count or start < 0 or start + count > len(geometry.vertices):
+            raise ValueError("Blendshape hand manifest range mismatch")
+        hands.append(RuntimeHand(
+            start=start,
+            count=count,
+            template_index=template_index,
+            transform=rw_matrix_values(hand["transform"]),
+        ))
     return RuntimeProfile(
         geometry_hash=fnv1a_vertices(geometry.vertices),
         vertex_count=len(geometry.vertices),
-        translations=tuple(translations),
-        indices=tuple(tuple(value) for value in skin.vertex_bone_indices),
-        weights=tuple(tuple(value) for value in skin.vertex_bone_weights),
-        matrices=tuple(
-            tuple(tuple(component for component in row) for row in matrix)
-            for matrix in skin.bone_matrices
-        ),
+        hands=tuple(hands),
     )
 
 
@@ -310,36 +381,40 @@ def restore_native_skeleton(expanded_clump, native_clump):
     expanded_clump.frame_list = copy.deepcopy(native_clump.frame_list)
 
 
-def write_runtime_data(path: Path, poses, hand_animations, profiles):
+def write_runtime_data(path: Path, templates, hand_animations, profiles):
     data = bytearray(MAGIC)
     data += struct.pack("<II", VERSION, len(profiles))
-    for side in poses:
-        for pose in side:
-            for quaternion in pose:
-                data += struct.pack("<4f", *quaternion)
+    data += struct.pack("<I", len(templates))
+    for template in templates:
+        encoded_template = template.name.encode("ascii")
+        targets = [target for target in template.targets if target.name.casefold() != "relaxed"]
+        data += struct.pack(
+            "<III", len(encoded_template), template.vertex_count, len(targets)
+        )
+        data += encoded_template
+        for target in targets:
+            encoded_target = target.name.encode("ascii")
+            data += struct.pack("<I", len(encoded_target))
+            data += encoded_target
+            for position in target.positions:
+                data += struct.pack("<3f", *position)
+            for normal in target.normals:
+                data += struct.pack("<3f", *normal)
     data += struct.pack("<I", len(hand_animations))
-    for name, duration, tracks in hand_animations:
-        encoded_name = name.encode("ascii")
+    for animation in hand_animations:
+        encoded_name = animation.name.encode("ascii")
         data += struct.pack("<I", len(encoded_name))
         data += encoded_name
-        data += struct.pack("<f", duration)
-        for track in tracks:
-            data += struct.pack("<I", len(track))
-            for time, quaternion in track:
-                data += struct.pack("<5f", time, *quaternion)
+        data += struct.pack("<fI", animation.duration, len(animation.keys))
+        for key in animation.keys:
+            data += struct.pack("<2f", key.time, key.weight)
     for profile in profiles:
-        data += struct.pack(
-            "<QII", profile.geometry_hash, profile.vertex_count, RUNTIME_BONES
-        )
-        for translation in profile.translations:
-            data += struct.pack("<3f", *translation)
-        for indices in profile.indices:
-            data += struct.pack("<4B", *indices)
-        for weights in profile.weights:
-            data += struct.pack("<4f", *weights)
-        for matrix in profile.matrices:
-            for row in matrix:
-                data += struct.pack("<4f", *row)
+        data += struct.pack("<QI", profile.geometry_hash, profile.vertex_count)
+        for hand in profile.hands:
+            data += struct.pack(
+                "<III", hand.start, hand.count, hand.template_index
+            )
+            data += struct.pack("<16f", *hand.transform)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
 
@@ -365,9 +440,24 @@ def main() -> int:
     args = parse_args()
     sys.path.insert(0, str(args.dragonff.resolve()))
     from gtaLib.dff import dff
+    from blendshape_profiles import load_profiles
 
-    poses = load_pose_table(args.pose_source, args.rwfury_root)
-    hand_animations = load_hand_animation_table(args.gang_source, args.rwfury_root)
+    templates = load_profiles(args.blendshapes)
+    template_indices = {
+        template.name.casefold(): index for index, template in enumerate(templates)
+    }
+    available_targets = {
+        target.name.casefold()
+        for template in templates
+        for target in template.targets
+    }
+    hand_animations = make_morph_animations(
+        load_hand_animation_table(args.gang_source, args.rwfury_root),
+        available_targets,
+    )
+    manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    if manifest.get("version") != 1:
+        raise ValueError("Unsupported expanded-model manifest")
     args.output.mkdir(parents=True, exist_ok=True)
     profiles_by_hash = {}
     count = 0
@@ -394,11 +484,21 @@ def main() -> int:
             count += 1
             continue
         else:
+            file_reports = manifest["files"].get(expanded_path.name.casefold())
+            if file_reports is None:
+                raise ValueError(f"{expanded_path.name}: missing hand manifest")
             if len(expanded.clumps) != len(native.clumps):
                 raise ValueError(f"{expanded_path.name}: clump count mismatch")
+            report_index = 0
             for expanded_clump, native_clump in zip(expanded.clumps, native.clumps):
                 for geometry_index, geometry in enumerate(expanded_clump.geometry_list):
-                    profile = make_profile(geometry, expanded_clump, geometry_index)
+                    report = file_reports[report_index]
+                    report_index += 1
+                    if report["geometry"] != geometry_index:
+                        raise ValueError(f"{expanded_path.name}: geometry manifest mismatch")
+                    profile = make_profile(
+                        geometry, report, template_indices, templates
+                    )
                     previous = profiles_by_hash.get(profile.geometry_hash)
                     if previous is not None and previous != profile:
                         raise ValueError(
@@ -406,6 +506,8 @@ def main() -> int:
                         )
                     profiles_by_hash[profile.geometry_hash] = profile
                 restore_native_skeleton(expanded_clump, native_clump)
+            if report_index != len(file_reports):
+                raise ValueError(f"{expanded_path.name}: unused geometry manifest entries")
 
         output_path = args.output / expanded_path.name
         expanded.write_file(str(output_path), expanded.rw_version)
@@ -417,9 +519,10 @@ def main() -> int:
         (args.output / txd_path.name).write_bytes(txd_path.read_bytes())
 
     profiles = tuple(profiles_by_hash.values())
-    write_runtime_data(args.data, poses, hand_animations, profiles)
+    write_runtime_data(args.data, templates, hand_animations, profiles)
     print(
         f"Runtime DFF={count} profiles={len(profiles)} "
+        f"blendshape_templates={len(templates)} "
         f"hand_sequences={len(hand_animations)} "
         f"data={args.data} ({args.data.stat().st_size} bytes)"
     )

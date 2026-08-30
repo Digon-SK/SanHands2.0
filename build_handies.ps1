@@ -4,6 +4,8 @@ param(
     [string]$DragonFF = 'C:\Users\Digon\AppData\Roaming\Blender Foundation\Blender\5.2\extensions\user_default\dragonff',
     [string]$PoseSource = 'C:\Users\Digon\Documents\ChatGPT\SanHands\dist\handpose.ifp',
     [string]$GangAnimationSource = 'C:\juegos\Grand Theft Auto San Andreas\modloader\hands\ghands.ifp',
+    [string]$BlendshapeSource = 'C:\Users\Digon\Desktop\Handies_Blendshape_Profiles.glb',
+    [string]$Blender = 'C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe',
     [string]$SourceModels = 'C:\Users\Digon\Desktop\peds',
     [string]$Hands = 'C:\Users\Digon\Desktop\hands',
     [string]$ModelsDir = 'C:\Users\Digon\Desktop\peds\con manos',
@@ -21,13 +23,30 @@ $env:DRAGONFF_PATH = $DragonFF
 New-Item -ItemType Directory -Force -Path `
     $DistDir, $ExpandedDir, $ModelsDir, $InstallDir | Out-Null
 
+$BlendshapeData = Join-Path $DistDir 'BlendshapeProfiles.dat'
+& $Blender --background --python `
+    (Join-Path $ProjectDir 'tools\extract_blendshape_profiles.py') -- `
+    --input $BlendshapeSource `
+    --output $BlendshapeData `
+    --project $ProjectDir `
+    --hands $Hands `
+    --pose-source $PoseSource `
+    --dragonff $DragonFF `
+    --rwfury-root $RwFury
+if ($LASTEXITCODE -ne 0) {
+    throw "La extracción del GLB blendshape falló con código $LASTEXITCODE"
+}
+
 # First build the already stitched/UV-mapped geometry with its temporary
 # 62-bone authoring rig. The finalizer immediately removes that rig from DFFs.
+$ExpandedManifest = Join-Path $DistDir 'expanded-manifest.json'
 & python (Join-Path $ProjectDir 'add_hands.py') `
     --input $SourceModels `
     --hands $Hands `
     --output $ExpandedDir `
     --dragonff $DragonFF `
+    --blendshapes $BlendshapeData `
+    --manifest $ExpandedManifest `
     --copy-txd
 if ($LASTEXITCODE -ne 0) {
     throw "La integración geométrica de las manos falló con código $LASTEXITCODE"
@@ -41,6 +60,8 @@ $RuntimeData = Join-Path $DistDir 'Handies.dat'
     --data $RuntimeData `
     --pose-source $PoseSource `
     --gang-source $GangAnimationSource `
+    --blendshapes $BlendshapeData `
+    --manifest $ExpandedManifest `
     --dragonff $DragonFF `
     --rwfury-root $RwFury
 if ($LASTEXITCODE -ne 0) {

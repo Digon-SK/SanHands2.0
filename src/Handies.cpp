@@ -55,18 +55,13 @@ constexpr std::uintptr_t entity_render_clump_call_address{0x53439C};
 constexpr std::size_t max_tracked_peds{256};
 constexpr std::size_t max_atomics_per_ped{16};
 constexpr int native_bone_count{32};
-constexpr int runtime_bone_count{62};
-constexpr int finger_bones_per_hand{15};
-constexpr int pose_count{3};
 constexpr int native_hand_signal_count{5};
 constexpr int maximum_animation_groups{139};
-constexpr int left_hand_id{34};
-constexpr int right_hand_id{24};
 constexpr char data_file_name[]{"Handies.dat"};
 constexpr char ini_file_name[]{"Handies.ini"};
 constexpr char log_file_name[]{"Handies.log"};
 constexpr std::array<char, 8> data_magic{'H', 'N', 'D', '2', 'D', 'A', 'T', '\0'};
-constexpr std::uint32_t data_version{4};
+constexpr std::uint32_t data_version{5};
 constexpr float minimum_visible_animation_blend{0.01F};
 constexpr std::uintptr_t hand_object_vtable_address{0x866EE0};
 constexpr std::uintptr_t hand_object_pre_render_slot{
@@ -82,32 +77,40 @@ struct Settings {
     float fucku_transition_speed{0.08F};
 };
 
-struct RuntimeProfile {
-    std::uint64_t geometry_hash{};
+struct MorphTarget {
+    std::string name{};
+    std::vector<RwV3d> positions{};
+    std::vector<RwV3d> normals{};
+};
+
+struct MorphTemplate {
+    std::string name{};
     std::uint32_t vertex_count{};
-    std::array<RwV3d, finger_bones_per_hand * 2> translations{};
-    std::vector<RwUInt32> indices{};
-    std::vector<RwMatrixWeights> weights{};
-    std::array<RwMatrix, runtime_bone_count> inverse_matrices{};
+    std::vector<MorphTarget> targets{};
 };
 
-using PoseTable = std::array<
-    std::array<std::array<RtQuat, finger_bones_per_hand>, pose_count>,
-    2>;
-
-struct FingerKey {
+struct MorphWeightKey {
     float time{};
-    RtQuat rotation{};
-};
-
-struct FingerTrack {
-    std::vector<FingerKey> keys{};
+    float weight{};
 };
 
 struct HandAnimation {
     std::string name{};
     float duration{};
-    std::array<FingerTrack, finger_bones_per_hand> tracks{};
+    std::vector<MorphWeightKey> keys{};
+};
+
+struct RuntimeHand {
+    std::uint32_t start{};
+    std::uint32_t count{};
+    std::uint32_t template_index{};
+    RwMatrix transform{};
+};
+
+struct RuntimeProfile {
+    std::uint64_t geometry_hash{};
+    std::uint32_t vertex_count{};
+    std::array<RuntimeHand, 2> hands{};
 };
 
 struct HandSequenceProfile {
@@ -161,15 +164,9 @@ static_assert(offsetof(NativeHandSignalTaskView, body_animation) == 0x08);
 static_assert(offsetof(NativeHandSignalTaskView, hand_animation_id) == 0x10);
 static_assert(offsetof(NativeHandSignalTaskView, right_hand) == 0x20);
 
-struct RuntimeBinding {
-    RpHAnimHierarchy* source_hierarchy{};
-    const RuntimeProfile* profile{};
-    std::array<RwMatrix, runtime_bone_count> pose_matrices{};
-};
-
 struct RuntimeAtomic {
     RpAtomic* atomic{};
-    std::size_t binding_index{};
+    const RuntimeProfile* profile{};
     std::vector<RwV3d> base_vertices{};
     std::vector<RwV3d> base_normals{};
 };
@@ -177,8 +174,6 @@ struct RuntimeAtomic {
 struct PedEntry {
     CPed* ped{};
     RpClump* clump{};
-    std::array<RuntimeBinding, max_atomics_per_ped> bindings{};
-    std::size_t binding_count{};
     std::array<RuntimeAtomic, max_atomics_per_ped> atomics{};
     std::size_t atomic_count{};
     float grip{};
@@ -189,11 +184,6 @@ struct AtomicList {
     std::array<RpAtomic*, max_atomics_per_ped> values{};
     std::size_t size{};
     bool overflow{};
-};
-
-struct HierarchyPlan {
-    RpHAnimHierarchy* source_hierarchy{};
-    const RuntimeProfile* profile{};
 };
 
 class BinaryReader final {
@@ -381,74 +371,48 @@ private:
     return result;
 }
 
-[[nodiscard]] RtQuat normalized_lerp(
-    const RtQuat& first,
-    RtQuat second,
-    float amount) noexcept {
-    const float dot{
-        first.imag.x * second.imag.x + first.imag.y * second.imag.y +
-        first.imag.z * second.imag.z + first.real * second.real};
-    if (dot < 0.0F) {
-        second.imag.x = -second.imag.x;
-        second.imag.y = -second.imag.y;
-        second.imag.z = -second.imag.z;
-        second.real = -second.real;
-    }
-    RtQuat result{};
-    result.imag.x = first.imag.x + (second.imag.x - first.imag.x) * amount;
-    result.imag.y = first.imag.y + (second.imag.y - first.imag.y) * amount;
-    result.imag.z = first.imag.z + (second.imag.z - first.imag.z) * amount;
-    result.real = first.real + (second.real - first.real) * amount;
-    const float length_squared{
-        result.imag.x * result.imag.x + result.imag.y * result.imag.y +
-        result.imag.z * result.imag.z + result.real * result.real};
-    if (length_squared <= 1.0e-12F) {
-        result.imag = {0.0F, 0.0F, 0.0F};
-        result.real = 1.0F;
-        return result;
-    }
-    const float inverse_length{1.0F / std::sqrt(length_squared)};
-    result.imag.x *= inverse_length;
-    result.imag.y *= inverse_length;
-    result.imag.z *= inverse_length;
-    result.real *= inverse_length;
-    return result;
-}
-
-[[nodiscard]] RtQuat sample_track(
-    const FingerTrack& track,
+[[nodiscard]] float sample_track(
+    const HandAnimation& animation,
     float time) noexcept {
-    if (track.keys.empty()) {
-        RtQuat identity{};
-        identity.real = 1.0F;
-        return identity;
+    if (animation.keys.empty()) return 0.0F;
+    if (time <= animation.keys.front().time) {
+        return animation.keys.front().weight;
     }
-    if (time <= track.keys.front().time) return track.keys.front().rotation;
-    if (time >= track.keys.back().time) return track.keys.back().rotation;
-    for (std::size_t index{1}; index < track.keys.size(); ++index) {
-        const FingerKey& second{track.keys[index]};
+    if (time >= animation.keys.back().time) {
+        return animation.keys.back().weight;
+    }
+    for (std::size_t index{1}; index < animation.keys.size(); ++index) {
+        const MorphWeightKey& second{animation.keys[index]};
         if (time > second.time) continue;
-        const FingerKey& first{track.keys[index - 1]};
+        const MorphWeightKey& first{animation.keys[index - 1]};
         const float span{second.time - first.time};
         const float amount{span > 1.0e-6F
             ? std::clamp((time - first.time) / span, 0.0F, 1.0F)
             : 0.0F};
-        return normalized_lerp(first.rotation, second.rotation, amount);
+        return std::clamp(
+            first.weight + (second.weight - first.weight) * amount,
+            0.0F, 1.0F);
     }
-    return track.keys.back().rotation;
+    return std::clamp(animation.keys.back().weight, 0.0F, 1.0F);
 }
 
-[[nodiscard]] int parent_source_id(int source_id) noexcept {
-    switch (source_id) {
-    case 3:
-    case 6:
-    case 9:
-    case 12:
-    case 15:
-        return 2;
-    default:
-        return source_id - 1;
+[[nodiscard]] const MorphTarget* find_morph_target(
+    const MorphTemplate& morph_template,
+    std::string_view name) noexcept {
+    for (const auto& target : morph_template.targets) {
+        if (equals_ignore_case(target.name, name)) return &target;
     }
+    return nullptr;
+}
+
+void normalize_vector(RwV3d& value) noexcept {
+    const float length_squared{
+        value.x * value.x + value.y * value.y + value.z * value.z};
+    if (length_squared <= 1.0e-12F) return;
+    const float inverse_length{1.0F / std::sqrt(length_squared)};
+    value.x *= inverse_length;
+    value.y *= inverse_length;
+    value.z *= inverse_length;
 }
 
 RpAtomic* collect_atomic(RpAtomic* atomic, void* data) noexcept {
@@ -787,16 +751,59 @@ private:
                 profile_count == 0 || profile_count > 1024) {
                 return false;
             }
-            PoseTable poses{};
-            for (auto& side : poses) {
-                for (auto& pose : side) {
-                    for (auto& quaternion : pose) {
-                        std::array<float, 4> packed{};
-                        if (!reader.read(packed)) return false;
-                        quaternion.imag = {packed[0], packed[1], packed[2]};
-                        quaternion.real = packed[3];
-                    }
+            std::uint32_t template_count{};
+            if (!reader.read(template_count) || template_count != 4) return false;
+            std::vector<MorphTemplate> morph_templates{};
+            morph_templates.reserve(template_count);
+            for (std::uint32_t template_index{}; template_index < template_count;
+                 ++template_index) {
+                MorphTemplate morph_template{};
+                std::uint32_t name_length{};
+                std::uint32_t target_count{};
+                if (!reader.read(name_length) ||
+                    !reader.read(morph_template.vertex_count) ||
+                    !reader.read(target_count) || name_length == 0 ||
+                    name_length > 63 || morph_template.vertex_count == 0 ||
+                    morph_template.vertex_count > 10000 || target_count == 0 ||
+                    target_count > 32) {
+                    return false;
                 }
+                morph_template.name.resize(name_length);
+                if (!reader.read_bytes(morph_template.name.data(), name_length)) {
+                    return false;
+                }
+                morph_template.targets.reserve(target_count);
+                for (std::uint32_t target_index{}; target_index < target_count;
+                     ++target_index) {
+                    MorphTarget target{};
+                    std::uint32_t target_name_length{};
+                    if (!reader.read(target_name_length) ||
+                        target_name_length == 0 || target_name_length > 63) {
+                        return false;
+                    }
+                    target.name.resize(target_name_length);
+                    if (!reader.read_bytes(
+                            target.name.data(), target_name_length)) {
+                        return false;
+                    }
+                    target.positions.resize(morph_template.vertex_count);
+                    target.normals.resize(morph_template.vertex_count);
+                    for (auto& position : target.positions) {
+                        if (!reader.read(position) || !std::isfinite(position.x) ||
+                            !std::isfinite(position.y) ||
+                            !std::isfinite(position.z)) {
+                            return false;
+                        }
+                    }
+                    for (auto& normal : target.normals) {
+                        if (!reader.read(normal) || !std::isfinite(normal.x) ||
+                            !std::isfinite(normal.y) || !std::isfinite(normal.z)) {
+                            return false;
+                        }
+                    }
+                    morph_template.targets.push_back(std::move(target));
+                }
+                morph_templates.push_back(std::move(morph_template));
             }
             std::uint32_t hand_animation_count{};
             if (!reader.read(hand_animation_count) || hand_animation_count == 0 ||
@@ -825,32 +832,22 @@ private:
                         return false;
                     }
                 }
-                for (auto& track : animation.tracks) {
-                    std::uint32_t key_count{};
-                    if (!reader.read(key_count) || key_count == 0 || key_count > 64) {
+                std::uint32_t key_count{};
+                if (!reader.read(key_count) || key_count == 0 || key_count > 256) {
+                    return false;
+                }
+                animation.keys.resize(key_count);
+                float previous_time{-1.0F};
+                for (auto& key : animation.keys) {
+                    if (!reader.read(key.time) || !reader.read(key.weight) ||
+                        !std::isfinite(key.time) ||
+                        !std::isfinite(key.weight) || key.time < previous_time ||
+                        key.time < 0.0F ||
+                        key.time > animation.duration + 1.0e-4F ||
+                        key.weight < 0.0F || key.weight > 1.0F) {
                         return false;
                     }
-                    track.keys.resize(key_count);
-                    float previous_time{-1.0F};
-                    for (auto& key : track.keys) {
-                        std::array<float, 4> packed{};
-                        if (!reader.read(key.time) || !reader.read(packed) ||
-                            !std::isfinite(key.time) || key.time < previous_time ||
-                            key.time < 0.0F ||
-                            key.time > animation.duration + 1.0e-4F) {
-                            return false;
-                        }
-                        key.rotation.imag = {packed[0], packed[1], packed[2]};
-                        key.rotation.real = packed[3];
-                        const float length_squared{
-                            packed[0] * packed[0] + packed[1] * packed[1] +
-                            packed[2] * packed[2] + packed[3] * packed[3]};
-                        if (!std::isfinite(length_squared) ||
-                            std::abs(length_squared - 1.0F) > 0.01F) {
-                            return false;
-                        }
-                        previous_time = key.time;
-                    }
+                    previous_time = key.time;
                 }
                 hand_animations.push_back(std::move(animation));
             }
@@ -859,45 +856,35 @@ private:
             for (std::uint32_t profile_index{}; profile_index < profile_count;
                  ++profile_index) {
                 RuntimeProfile profile{};
-                std::uint32_t bone_count{};
                 if (!reader.read(profile.geometry_hash) ||
-                    !reader.read(profile.vertex_count) || !reader.read(bone_count) ||
-                    profile.vertex_count == 0 || profile.vertex_count > 200000 ||
-                    bone_count != runtime_bone_count) {
+                    !reader.read(profile.vertex_count) ||
+                    profile.vertex_count == 0 || profile.vertex_count > 200000) {
                     return false;
                 }
-                for (auto& translation : profile.translations) {
-                    if (!reader.read(translation)) return false;
-                }
-                profile.indices.resize(profile.vertex_count);
-                for (auto& packed_indices : profile.indices) {
-                    std::array<std::uint8_t, 4> values{};
-                    if (!reader.read(values)) return false;
-                    packed_indices = static_cast<RwUInt32>(values[0]) |
-                        (static_cast<RwUInt32>(values[1]) << 8U) |
-                        (static_cast<RwUInt32>(values[2]) << 16U) |
-                        (static_cast<RwUInt32>(values[3]) << 24U);
-                }
-                profile.weights.resize(profile.vertex_count);
-                for (auto& weights : profile.weights) {
-                    if (!reader.read(weights)) return false;
-                }
-                for (auto& matrix : profile.inverse_matrices) {
+                for (auto& hand : profile.hands) {
                     std::array<float, 16> values{};
-                    if (!reader.read(values)) return false;
-                    matrix.right = {values[0], values[1], values[2]};
-                    matrix.flags = 0;
-                    matrix.up = {values[4], values[5], values[6]};
-                    matrix.pad1 = 0;
-                    matrix.at = {values[8], values[9], values[10]};
-                    matrix.pad2 = 0;
-                    matrix.pos = {values[12], values[13], values[14]};
-                    matrix.pad3 = 0;
+                    if (!reader.read(hand.start) || !reader.read(hand.count) ||
+                        !reader.read(hand.template_index) ||
+                        !reader.read(values) ||
+                        hand.template_index >= morph_templates.size() ||
+                        hand.count != morph_templates[hand.template_index].vertex_count ||
+                        hand.start > profile.vertex_count ||
+                        hand.count > profile.vertex_count - hand.start) {
+                        return false;
+                    }
+                    hand.transform.right = {values[0], values[1], values[2]};
+                    hand.transform.flags = 0;
+                    hand.transform.up = {values[4], values[5], values[6]};
+                    hand.transform.pad1 = 0;
+                    hand.transform.at = {values[8], values[9], values[10]};
+                    hand.transform.pad2 = 0;
+                    hand.transform.pos = {values[12], values[13], values[14]};
+                    hand.transform.pad3 = 0;
                 }
                 profiles.push_back(std::move(profile));
             }
             if (reader.remaining() != 0) return false;
-            poses_ = poses;
+            morph_templates_ = std::move(morph_templates);
             hand_animations_ = std::move(hand_animations);
             profiles_ = std::move(profiles);
             return true;
@@ -1070,16 +1057,14 @@ private:
         RpClump* clump{entry.ped != nullptr ? entry.ped->m_pRwClump : nullptr};
         if (clump == nullptr) return false;
         RpHAnimHierarchy* primary_hierarchy{GetAnimHierarchyFromSkinClump(clump)};
-        CAnimBlendClumpData* data{RpClumpGetAnimBlendClumpData(clump)};
-        if (primary_hierarchy == nullptr || data == nullptr ||
-            data->m_nNumFrames < native_bone_count || data->m_pFrames == nullptr) {
+        if (primary_hierarchy == nullptr ||
+            primary_hierarchy->numNodes != native_bone_count) {
             std::array<char, 192> message{};
             std::snprintf(
                 message.data(), message.size(),
-                "Inyeccion omitida: hierarchy=%p animData=%p frames=%d frameData=%p.",
-                static_cast<void*>(primary_hierarchy), static_cast<void*>(data),
-                data != nullptr ? data->m_nNumFrames : -1,
-                data != nullptr ? static_cast<void*>(data->m_pFrames) : nullptr);
+                "Inyeccion omitida: hierarchy=%p nodes=%d.",
+                static_cast<void*>(primary_hierarchy),
+                primary_hierarchy != nullptr ? primary_hierarchy->numNodes : -1);
             log_injection_failure(message.data());
             return false;
         }
@@ -1089,15 +1074,11 @@ private:
             log_injection_failure("Inyeccion omitida: clump sin atomics utilizables.");
             return false;
         }
-        const AtomicList clump_atomics{atomics};
-        atomics = {};
         std::array<const RuntimeProfile*, max_atomics_per_ped> profiles{};
-        std::array<std::size_t, max_atomics_per_ped> atomic_binding_indices{};
-        std::array<HierarchyPlan, max_atomics_per_ped> plans{};
-        std::size_t plan_count{};
-        for (std::size_t source_index{}; source_index < clump_atomics.size;
+        AtomicList matched{};
+        for (std::size_t source_index{}; source_index < atomics.size;
              ++source_index) {
-            RpAtomic* const atomic{clump_atomics.values[source_index]};
+            RpAtomic* const atomic{atomics.values[source_index]};
             RpGeometry* geometry{RpAtomicGetGeometry(atomic)};
             RpSkin* skin{geometry != nullptr ? RpSkinGeometryGetSkin(geometry) : nullptr};
             RpHAnimHierarchy* hierarchy{RpSkinAtomicGetHAnimHierarchy(atomic)};
@@ -1107,25 +1088,12 @@ private:
                 hierarchy->numNodes != native_bone_count) {
                 continue;
             }
-            const std::size_t index{atomics.size++};
-            atomics.values[index] = atomic;
+            const std::size_t index{matched.size++};
+            matched.values[index] = atomic;
             profiles[index] = profile;
-            std::size_t binding_index{plan_count};
-            for (std::size_t plan_index{}; plan_index < plan_count; ++plan_index) {
-                if (plans[plan_index].source_hierarchy == hierarchy &&
-                    plans[plan_index].profile == profiles[index]) {
-                    binding_index = plan_index;
-                    break;
-                }
-            }
-            if (binding_index == plan_count) {
-                plans[plan_count] = {hierarchy, profiles[index]};
-                ++plan_count;
-            }
-            atomic_binding_indices[index] = binding_index;
         }
-        if (atomics.size == 0) {
-            RpAtomic* const atomic{clump_atomics.values[0]};
+        if (matched.size == 0) {
+            RpAtomic* const atomic{atomics.values[0]};
             RpGeometry* const geometry{atomic != nullptr
                 ? RpAtomicGetGeometry(atomic)
                 : nullptr};
@@ -1139,7 +1107,7 @@ private:
             std::snprintf(
                 message.data(), message.size(),
                 "Inyeccion omitida: atomics=%u vertices=%d hash=%016llX skinBones=%u hierarchyNodes=%d profile=0.",
-                static_cast<unsigned>(clump_atomics.size),
+                static_cast<unsigned>(atomics.size),
                 geometry != nullptr ? RpGeometryGetNumVertices(geometry) : -1,
                 static_cast<unsigned long long>(hash_geometry(geometry)),
                 skin != nullptr ? static_cast<unsigned>(RpSkinGetNumBones(skin)) : 0U,
@@ -1148,16 +1116,10 @@ private:
             return false;
         }
         entry.clump = clump;
-        entry.binding_count = plan_count;
-        for (std::size_t index{}; index < plan_count; ++index) {
-            entry.bindings[index].source_hierarchy =
-                plans[index].source_hierarchy;
-            entry.bindings[index].profile = plans[index].profile;
-        }
-        entry.atomic_count = atomics.size;
-        for (std::size_t index{}; index < atomics.size; ++index) {
+        entry.atomic_count = matched.size;
+        for (std::size_t index{}; index < matched.size; ++index) {
             RpGeometry* const geometry{
-                RpAtomicGetGeometry(atomics.values[index])};
+                RpAtomicGetGeometry(matched.values[index])};
             const RpMorphTarget* const morph{
                 RpGeometryGetMorphTarget(geometry, 0)};
             const RwV3d* const vertices{RpMorphTargetGetVertices(morph)};
@@ -1169,8 +1131,8 @@ private:
                 return false;
             }
             const std::size_t vertex_count{profiles[index]->vertex_count};
-            entry.atomics[index].atomic = atomics.values[index];
-            entry.atomics[index].binding_index = atomic_binding_indices[index];
+            entry.atomics[index].atomic = matched.values[index];
+            entry.atomics[index].profile = profiles[index];
             entry.atomics[index].base_vertices.assign(
                 vertices, vertices + vertex_count);
             if (normals != nullptr) {
@@ -1315,145 +1277,25 @@ private:
             if (entry == nullptr) return nullptr;
             update_finger_state(*entry);
         }
-        apply_finger_matrices(*entry);
+        apply_blendshapes(*entry);
         return entry;
     }
 
-    void apply_finger_matrices(PedEntry& entry) noexcept {
+    void apply_blendshapes(PedEntry& entry) noexcept {
         const ActiveHandSequence configured_sequence{entry.ped != nullptr
             ? find_active_hand_sequence(*entry.ped)
             : ActiveHandSequence{}};
         const HandSignalState signal{entry.ped != nullptr
             ? read_hand_signal_state(*entry.ped)
             : HandSignalState{}};
-        for (std::size_t binding_index{};
-             binding_index < entry.binding_count;
-            ++binding_index) {
-            RuntimeBinding& binding{entry.bindings[binding_index]};
-            if (binding.source_hierarchy == nullptr ||
-                binding.profile == nullptr ||
-                binding.source_hierarchy->numNodes != native_bone_count ||
-                binding.source_hierarchy->pNodeInfo == nullptr) {
-                continue;
-            }
-            RwMatrix* const matrices{binding.pose_matrices.data()};
-            for (int index{}; index < native_bone_count; ++index) {
-                RwMatrixInvert(
-                    &matrices[index],
-                    &binding.profile->inverse_matrices[
-                        static_cast<std::size_t>(index)]);
-            }
-            for (int side{}; side < 2; ++side) {
-                const int hand_index{RpHAnimIDGetIndex(
-                    binding.source_hierarchy,
-                    side == 0 ? left_hand_id : right_hand_id)};
-                if (hand_index < 0 || hand_index >= native_bone_count) continue;
-                for (int source_id{3}; source_id <= 17; ++source_id) {
-                    const int target_index{
-                        native_bone_count + side * finger_bones_per_hand +
-                        source_id - 3};
-                    const int parent_source{parent_source_id(source_id)};
-                    const int parent_index{parent_source == 2
-                        ? hand_index
-                        : native_bone_count + side * finger_bones_per_hand +
-                            parent_source - 3};
-                    if (target_index < 0 || target_index >= runtime_bone_count ||
-                        parent_index < 0 || parent_index >= runtime_bone_count) {
-                        break;
-                    }
-                    const std::size_t finger_index{
-                        static_cast<std::size_t>(source_id - 3)};
-                    RtQuat rotation{normalized_lerp(
-                        poses_[side][0][finger_index],
-                        poses_[side][1][finger_index],
-                        std::clamp(entry.grip, 0.0F, 1.0F))};
-                    if (side == 1) {
-                        rotation = normalized_lerp(
-                            rotation, poses_[side][2][finger_index],
-                            smoothstep(entry.fucku_blend));
-                    }
-                    bool configured_side_active{};
-                    if (configured_sequence.profile != nullptr &&
-                        configured_sequence.association != nullptr) {
-                        const int animation_index{side == 0
-                            ? configured_sequence.profile->left_animation
-                            : configured_sequence.profile->right_animation};
-                        if (animation_index >= 0 &&
-                            static_cast<std::size_t>(animation_index) <
-                                hand_animations_.size()) {
-                            const HandAnimation& animation{
-                                hand_animations_[static_cast<std::size_t>(
-                                    animation_index)]};
-                            const RtQuat sampled{sample_track(
-                                animation.tracks[finger_index],
-                                sequence_time(
-                                    animation, *configured_sequence.profile,
-                                    *configured_sequence.association))};
-                            const float blend{std::clamp(
-                                configured_sequence.association->m_fBlendAmount *
-                                    configured_sequence.profile->weight,
-                                0.0F, 1.0F)};
-                            rotation = normalized_lerp(rotation, sampled, blend);
-                            configured_side_active = true;
-                        }
-                    }
-                    const bool signal_active{!configured_side_active &&
-                        signal.animation_index >= 0 &&
-                        ((side == 0 && signal.left) ||
-                         (side == 1 && signal.right))};
-                    if (signal_active) {
-                        std::array<char, 16> animation_name{};
-                        std::snprintf(
-                            animation_name.data(), animation_name.size(),
-                            "%cHGsign%d", side == 0 ? 'L' : 'R',
-                            signal.animation_index + 1);
-                        const int fallback_index{
-                            find_hand_animation_index(animation_name.data())};
-                        if (fallback_index >= 0) {
-                            const HandAnimation& animation{
-                                hand_animations_[static_cast<std::size_t>(
-                                    fallback_index)]};
-                            rotation = sample_track(
-                                animation.tracks[finger_index],
-                                std::min(signal.time, animation.duration));
-                        }
-                    }
-                    RwMatrix local{};
-                    RtQuatConvertToMatrix(&rotation, &local);
-                    local.pos = binding.profile->translations[
-                        static_cast<std::size_t>(side * finger_bones_per_hand) +
-                        finger_index];
-                    RwMatrixMultiply(&matrices[target_index], &local,
-                                     &matrices[parent_index]);
-                }
-            }
-        }
-        deform_hand_profiles(entry);
-    }
-
-    void deform_hand_profiles(PedEntry& entry) noexcept {
-        constexpr float minimum_weight{1.0e-6F};
         for (std::size_t atomic_index{}; atomic_index < entry.atomic_count;
              ++atomic_index) {
             RuntimeAtomic& item{entry.atomics[atomic_index]};
-            if (item.atomic == nullptr || item.binding_index >= entry.binding_count) {
-                continue;
-            }
-            RuntimeBinding& binding{entry.bindings[item.binding_index]};
-            const RuntimeProfile* const profile{binding.profile};
+            const RuntimeProfile* const profile{item.profile};
             RpGeometry* const geometry{RpAtomicGetGeometry(item.atomic)};
             if (profile == nullptr || geometry == nullptr ||
-                item.base_vertices.size() != profile->vertex_count ||
-                profile->weights.size() != profile->vertex_count ||
-                profile->indices.size() != profile->vertex_count) {
+                item.base_vertices.size() != profile->vertex_count) {
                 continue;
-            }
-            std::array<RwMatrix, runtime_bone_count> skin_matrices{};
-            for (int bone{}; bone < runtime_bone_count; ++bone) {
-                RwMatrixMultiply(
-                    &skin_matrices[static_cast<std::size_t>(bone)],
-                    &profile->inverse_matrices[static_cast<std::size_t>(bone)],
-                    &binding.pose_matrices[static_cast<std::size_t>(bone)]);
             }
             const bool has_normals{
                 item.base_normals.size() == item.base_vertices.size()};
@@ -1469,66 +1311,111 @@ private:
                 RpGeometryUnlock(geometry);
                 continue;
             }
-            for (std::size_t vertex{}; vertex < item.base_vertices.size(); ++vertex) {
-                const RwUInt32 packed{profile->indices[vertex]};
-                const std::array<RwUInt32, 4> bone_indices{
-                    packed & 0xFFU,
-                    (packed >> 8U) & 0xFFU,
-                    (packed >> 16U) & 0xFFU,
-                    (packed >> 24U) & 0xFFU};
-                const RwMatrixWeights& packed_weights{profile->weights[vertex]};
-                const std::array<float, 4> weights{
-                    packed_weights.w0, packed_weights.w1,
-                    packed_weights.w2, packed_weights.w3};
-                bool belongs_to_finger_profile{};
-                for (std::size_t slot{}; slot < weights.size(); ++slot) {
-                    if (weights[slot] > minimum_weight &&
-                        bone_indices[slot] >= native_bone_count) {
-                        belongs_to_finger_profile = true;
-                        break;
-                    }
-                }
-                if (!belongs_to_finger_profile) continue;
+            for (std::size_t side{}; side < profile->hands.size(); ++side) {
+                const RuntimeHand& hand{profile->hands[side]};
+                if (hand.template_index >= morph_templates_.size()) continue;
+                const MorphTemplate& morph_template{
+                    morph_templates_[hand.template_index]};
+                if (hand.count != morph_template.vertex_count) continue;
 
-                RwV3d morphed{};
-                RwV3d morphed_normal{};
-                for (std::size_t slot{}; slot < weights.size(); ++slot) {
-                    const float weight{weights[slot]};
-                    const RwUInt32 bone{bone_indices[slot]};
-                    if (weight <= minimum_weight || bone >= runtime_bone_count) {
-                        continue;
-                    }
-                    RwV3d transformed{};
-                    RwV3dTransformPoint(
-                        &transformed, &item.base_vertices[vertex],
-                        &skin_matrices[bone]);
-                    morphed.x += transformed.x * weight;
-                    morphed.y += transformed.y * weight;
-                    morphed.z += transformed.z * weight;
-                    if (has_normals) {
-                        RwV3d transformed_normal{};
-                        RwV3dTransformVector(
-                            &transformed_normal, &item.base_normals[vertex],
-                            &skin_matrices[bone]);
-                        morphed_normal.x += transformed_normal.x * weight;
-                        morphed_normal.y += transformed_normal.y * weight;
-                        morphed_normal.z += transformed_normal.z * weight;
+                const MorphTarget* const grip{
+                    find_morph_target(morph_template, "Grip")};
+                const MorphTarget* const fucku{side == 1
+                    ? find_morph_target(morph_template, "FuckU")
+                    : nullptr};
+                const MorphTarget* sequence_target{};
+                float sequence_blend{};
+                bool configured_side_active{};
+                if (configured_sequence.profile != nullptr &&
+                    configured_sequence.association != nullptr) {
+                    const int animation_index{side == 0
+                        ? configured_sequence.profile->left_animation
+                        : configured_sequence.profile->right_animation};
+                    if (animation_index >= 0 &&
+                        static_cast<std::size_t>(animation_index) <
+                            hand_animations_.size()) {
+                        const HandAnimation& animation{
+                            hand_animations_[static_cast<std::size_t>(animation_index)]};
+                        sequence_target = find_morph_target(
+                            morph_template, animation.name);
+                        if (sequence_target != nullptr) {
+                            sequence_blend = sample_track(
+                                animation,
+                                sequence_time(
+                                    animation, *configured_sequence.profile,
+                                    *configured_sequence.association));
+                            sequence_blend *= std::clamp(
+                                configured_sequence.association->m_fBlendAmount *
+                                    configured_sequence.profile->weight,
+                                0.0F, 1.0F);
+                            configured_side_active = true;
+                        }
                     }
                 }
-                vertices[vertex] = morphed;
-                if (has_normals) {
-                    const float length_squared{
-                        morphed_normal.x * morphed_normal.x +
-                        morphed_normal.y * morphed_normal.y +
-                        morphed_normal.z * morphed_normal.z};
-                    if (length_squared > 1.0e-12F) {
-                        const float inverse_length{
-                            1.0F / std::sqrt(length_squared)};
-                        morphed_normal.x *= inverse_length;
-                        morphed_normal.y *= inverse_length;
-                        morphed_normal.z *= inverse_length;
+                if (!configured_side_active && signal.animation_index >= 0 &&
+                    ((side == 0 && signal.left) ||
+                     (side == 1 && signal.right))) {
+                    std::array<char, 16> animation_name{};
+                    std::snprintf(
+                        animation_name.data(), animation_name.size(),
+                        "%cHGsign%d", side == 0 ? 'L' : 'R',
+                        signal.animation_index + 1);
+                    const int fallback_index{
+                        find_hand_animation_index(animation_name.data())};
+                    if (fallback_index >= 0) {
+                        const HandAnimation& animation{
+                            hand_animations_[static_cast<std::size_t>(fallback_index)]};
+                        sequence_target = find_morph_target(
+                            morph_template, animation.name);
+                        sequence_blend = sequence_target != nullptr
+                            ? sample_track(
+                                animation, std::min(signal.time, animation.duration))
+                            : 0.0F;
                     }
-                    normals[vertex] = morphed_normal;
+                }
+
+                const float grip_blend{std::clamp(entry.grip, 0.0F, 1.0F)};
+                const float fucku_blend{side == 1
+                    ? smoothstep(entry.fucku_blend)
+                    : 0.0F};
+                for (std::uint32_t local_index{}; local_index < hand.count;
+                     ++local_index) {
+                    const std::size_t vertex{
+                        static_cast<std::size_t>(hand.start + local_index)};
+                    RwV3d position{item.base_vertices[vertex]};
+                    RwV3d normal{has_normals
+                        ? item.base_normals[vertex]
+                        : RwV3d{}};
+                    const auto blend_target = [&](
+                        const MorphTarget* target, float amount) noexcept {
+                        if (target == nullptr || amount <= 0.0F) return;
+                        RwV3d target_position{};
+                        RwV3dTransformPoint(
+                            &target_position,
+                            &target->positions[local_index], &hand.transform);
+                        position.x += (target_position.x - position.x) * amount;
+                        position.y += (target_position.y - position.y) * amount;
+                        position.z += (target_position.z - position.z) * amount;
+                        if (has_normals) {
+                            RwV3d target_normal{};
+                            RwV3dTransformVector(
+                                &target_normal,
+                                &target->normals[local_index], &hand.transform);
+                            normalize_vector(target_normal);
+                            normal.x += (target_normal.x - normal.x) * amount;
+                            normal.y += (target_normal.y - normal.y) * amount;
+                            normal.z += (target_normal.z - normal.z) * amount;
+                        }
+                    };
+                    blend_target(grip, grip_blend);
+                    blend_target(fucku, fucku_blend);
+                    blend_target(
+                        sequence_target, std::clamp(sequence_blend, 0.0F, 1.0F));
+                    vertices[vertex] = position;
+                    if (has_normals) {
+                        normalize_vector(normal);
+                        normals[vertex] = normal;
+                    }
                 }
             }
             RpGeometryUnlock(geometry);
@@ -1578,7 +1465,7 @@ private:
     }
 
     Settings settings_{};
-    PoseTable poses_{};
+    std::vector<MorphTemplate> morph_templates_{};
     std::vector<HandAnimation> hand_animations_{};
     std::vector<HandSequenceProfile> sequence_profiles_{};
     std::vector<PedAnimationMapping> animation_mappings_{};
