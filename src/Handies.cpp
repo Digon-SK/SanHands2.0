@@ -343,8 +343,8 @@ private:
     HandSignalState result{};
     if (ped.m_pIntelligence == nullptr) return result;
 
-    CTask* const task{ped.m_pIntelligence->m_TaskMgr.FindTaskByType(
-        TASK_SECONDARY_PARTIAL_ANIM, TASK_SIMPLE_HANDSIGNAL_ANIM)};
+    CTask* const task{ped.m_pIntelligence->m_TaskMgr.FindActiveTaskByType(
+        TASK_SIMPLE_HANDSIGNAL_ANIM)};
     if (task == nullptr) return result;
 
     const auto* const signal{
@@ -459,6 +459,10 @@ public:
 
         plugin::Events::initGameEvent += [this] {
             release_all();
+            configuration_retry_count_ = 0;
+            next_configuration_retry_ms_ = 0;
+            configured_sequence_logged_ = false;
+            native_signal_logged_ = false;
             load_settings();
             install_final_render_hook();
             if (profiles_.empty() && !load_runtime_data()) {
@@ -571,23 +575,21 @@ private:
         const int group_count{std::clamp(
             CAnimManager::ms_numAnimAssocDefinitions,
             0, maximum_animation_groups)};
-        for (int group{}; group < group_count; ++group) {
+        const auto add_for_group = [&](int group) {
+            if (group < 0 || group >= group_count ||
+                CAnimManager::ms_aAnimAssocGroups == nullptr) {
+                return;
+            }
             const CAnimBlendAssocGroup& assoc_group{
                 CAnimManager::ms_aAnimAssocGroups[group]};
             if (assoc_group.m_pAssociations == nullptr ||
                 assoc_group.m_nNumAnimations == 0) {
-                continue;
+                return;
             }
-            const char* const group_name{CAnimManager::GetAnimGroupName(group)};
-            const char* const block_name{CAnimManager::GetAnimBlockName(group)};
-            const bool owner_matches{owner == "*" ||
-                (group_name != nullptr && equals_ignore_case(owner, group_name)) ||
-                (block_name != nullptr && equals_ignore_case(owner, block_name))};
-            if (!owner_matches) continue;
-
             CAnimBlendStaticAssociation* const association{
-                CAnimManager::GetAnimAssociation(group, animation_name.c_str())};
-            if (association == nullptr) continue;
+                CAnimManager::GetAnimAssociation(
+                    group, animation_name.c_str())};
+            if (association == nullptr) return;
             const auto duplicate{std::find_if(
                 animation_mappings_.begin(), animation_mappings_.end(),
                 [association](const PedAnimationMapping& mapping) {
@@ -602,6 +604,29 @@ private:
                     association->m_nAnimId,
                     profile_index});
             }
+        };
+
+        // These native groups are available by fixed ID even when their
+        // descriptor names have not yet been exposed by CAnimManager.
+        if (equals_ignore_case(owner, "handsignal")) {
+            add_for_group(static_cast<int>(ANIM_GROUP_HANDSIGNAL));
+        } else if (equals_ignore_case(owner, "handsignall")) {
+            add_for_group(static_cast<int>(ANIM_GROUP_HANDSIGNALL));
+        }
+        for (int group{}; group < group_count; ++group) {
+            const CAnimBlendAssocGroup& assoc_group{
+                CAnimManager::ms_aAnimAssocGroups[group]};
+            if (assoc_group.m_pAssociations == nullptr ||
+                assoc_group.m_nNumAnimations == 0) {
+                continue;
+            }
+            const char* const group_name{CAnimManager::GetAnimGroupName(group)};
+            const char* const block_name{CAnimManager::GetAnimBlockName(group)};
+            const bool owner_matches{owner == "*" ||
+                (group_name != nullptr && equals_ignore_case(owner, group_name)) ||
+                (block_name != nullptr && equals_ignore_case(owner, block_name))};
+            if (!owner_matches) continue;
+            add_for_group(group);
         }
     }
 
@@ -1195,6 +1220,20 @@ private:
         // Handies is loaded before some graphics ASIs. Installing on the first
         // gameplay tick preserves and chains the final target chosen by them.
         install_final_render_hook();
+        constexpr unsigned int retry_interval_ms{1000U};
+        constexpr unsigned int maximum_retries{10U};
+        const unsigned int now{CTimer::m_snTimeInMilliseconds};
+        if (animation_mappings_.empty() &&
+            configuration_retry_count_ < maximum_retries &&
+            now >= next_configuration_retry_ms_) {
+            try {
+                load_sequence_configuration();
+            } catch (...) {
+                log("ERROR: no se pudo reintentar la configuracion de secuencias.");
+            }
+            ++configuration_retry_count_;
+            next_configuration_retry_ms_ = now + retry_interval_ms;
+        }
         for (auto& entry : entries_) {
             if (entry.ped == nullptr) continue;
             update_finger_state(entry);
@@ -1288,6 +1327,27 @@ private:
         const HandSignalState signal{entry.ped != nullptr
             ? read_hand_signal_state(*entry.ped)
             : HandSignalState{}};
+        if (configured_sequence.profile != nullptr &&
+            !configured_sequence_logged_) {
+            std::array<char, 160> message{};
+            std::snprintf(
+                message.data(), message.size(),
+                "Blendshape por asociacion PED activo: perfil=%s.",
+                configured_sequence.profile->name.c_str());
+            log(message.data());
+            configured_sequence_logged_ = true;
+        }
+        if (signal.animation_index >= 0 && !native_signal_logged_) {
+            std::array<char, 160> message{};
+            std::snprintf(
+                message.data(), message.size(),
+                "Blendshape por tarea HANDSIGNAL activo: indice=%d left=%d right=%d.",
+                signal.animation_index + 1,
+                signal.left ? 1 : 0,
+                signal.right ? 1 : 0);
+            log(message.data());
+            native_signal_logged_ = true;
+        }
         for (std::size_t atomic_index{}; atomic_index < entry.atomic_count;
              ++atomic_index) {
             RuntimeAtomic& item{entry.atomics[atomic_index]};
@@ -1484,6 +1544,10 @@ private:
     bool final_render_hook_attempted_{};
     bool final_render_hook_installed_{};
     std::size_t injection_failure_logs_{};
+    unsigned int configuration_retry_count_{};
+    unsigned int next_configuration_retry_ms_{};
+    bool configured_sequence_logged_{};
+    bool native_signal_logged_{};
 };
 
 HandiesMod handies_mod{};
