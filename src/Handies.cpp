@@ -572,6 +572,43 @@ private:
                 std::string_view{owner}.substr(owner.size() - 4), ".ifp")) {
             owner.resize(owner.size() - 4);
         }
+        const auto store_mapping = [this, profile_index](
+            unsigned short group,
+            short animation) {
+            const auto duplicate{std::find_if(
+                animation_mappings_.begin(), animation_mappings_.end(),
+                [group, animation](const PedAnimationMapping& mapping) {
+                    return mapping.group == group &&
+                           mapping.animation == animation;
+                })};
+            if (duplicate != animation_mappings_.end()) {
+                duplicate->profile_index = profile_index;
+            } else {
+                animation_mappings_.push_back({group, animation, profile_index});
+            }
+        };
+
+        // Native hand-signal IDs are fixed in GTA SA 1.0 US. Resolve them
+        // without consulting plugin-sdk's incorrect ms_aAnimAssocGroups view.
+        constexpr std::string_view signal_prefix{"gsign"};
+        if ((equals_ignore_case(owner, "handsignal") ||
+             equals_ignore_case(owner, "handsignall")) &&
+            animation_name.size() > signal_prefix.size() &&
+            equals_ignore_case(
+                std::string_view{animation_name}.substr(0, signal_prefix.size()),
+                signal_prefix)) {
+            const char digit{animation_name[signal_prefix.size()]};
+            if (digit >= '1' && digit <= '5') {
+                const auto group{static_cast<unsigned short>(
+                    equals_ignore_case(owner, "handsignal")
+                        ? ANIM_GROUP_HANDSIGNAL
+                        : ANIM_GROUP_HANDSIGNALL)};
+                const auto animation{static_cast<short>(
+                    static_cast<int>(ANIM_HANDSIGNAL_GSIGN1) + digit - '1')};
+                store_mapping(group, animation);
+                return;
+            }
+        }
         const int group_count{std::clamp(
             CAnimManager::ms_numAnimAssocDefinitions,
             0, maximum_animation_groups)};
@@ -581,36 +618,9 @@ private:
                 CAnimManager::GetAnimAssociation(
                     group, animation_name.c_str())};
             if (association == nullptr) return;
-            const auto duplicate{std::find_if(
-                animation_mappings_.begin(), animation_mappings_.end(),
-                [association](const PedAnimationMapping& mapping) {
-                    return mapping.group == association->m_nAnimGroup &&
-                           mapping.animation == association->m_nAnimId;
-                })};
-            if (duplicate != animation_mappings_.end()) {
-                duplicate->profile_index = profile_index;
-            } else {
-                animation_mappings_.push_back({
-                    association->m_nAnimGroup,
-                    association->m_nAnimId,
-                    profile_index});
-            }
+            store_mapping(association->m_nAnimGroup, association->m_nAnimId);
         };
-
-        // These native groups are available by fixed ID even when their
-        // descriptor names have not yet been exposed by CAnimManager.
-        if (equals_ignore_case(owner, "handsignal")) {
-            add_for_group(static_cast<int>(ANIM_GROUP_HANDSIGNAL));
-        } else if (equals_ignore_case(owner, "handsignall")) {
-            add_for_group(static_cast<int>(ANIM_GROUP_HANDSIGNALL));
-        }
         for (int group{}; group < group_count; ++group) {
-            const CAnimBlendAssocGroup& assoc_group{
-                CAnimManager::ms_aAnimAssocGroups[group]};
-            if (assoc_group.m_pAssociations == nullptr ||
-                assoc_group.m_nNumAnimations == 0) {
-                continue;
-            }
             const char* const group_name{CAnimManager::GetAnimGroupName(group)};
             const char* const block_name{CAnimManager::GetAnimBlockName(group)};
             const bool owner_matches{owner == "*" ||
