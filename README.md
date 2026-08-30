@@ -27,7 +27,7 @@ The generated DFFs contain the replacement hand geometry, closed wrist seams, co
 The installed mod consists of:
 
 - `Handies.asi`: render-time hand-profile blending and finger animation.
-- `Handies.dat`: edited GLB positions/normals, geometry-specific hand ranges/transforms, and the timelines derived from the hand IFP.
+- `Handies.dat`: edited GLB positions/normals (including the `Relaxed` basis), geometry-specific hand ranges/transforms, and the timelines derived from the hand IFP. Runtime matching uses the full geometry hash first and falls back to a bounded fit of the hand surfaces, so harmless changes elsewhere in a DFF do not disable its blendshapes.
 - `Handies.ini`: enable/player/NPC settings, hand-sequence profiles, and ped-animation mappings.
 - Final DFF/TXD files: hand geometry with the native skeleton only.
 

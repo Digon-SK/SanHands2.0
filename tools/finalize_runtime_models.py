@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 MAGIC = b"HND2DAT\0"
-VERSION = 5
+VERSION = 6
 NATIVE_BONES = 32
 RUNTIME_BONES = 62
 FINGER_IDS = tuple(range(3, 18))
@@ -387,7 +387,7 @@ def write_runtime_data(path: Path, templates, hand_animations, profiles):
     data += struct.pack("<I", len(templates))
     for template in templates:
         encoded_template = template.name.encode("ascii")
-        targets = [target for target in template.targets if target.name.casefold() != "relaxed"]
+        targets = list(template.targets)
         data += struct.pack(
             "<III", len(encoded_template), template.vertex_count, len(targets)
         )

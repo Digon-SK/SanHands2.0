@@ -205,7 +205,7 @@ try:
     if len(data) < 16 or data[:8] != b"HND2DAT\0":
         raise ValueError("invalid magic")
     version, profile_count = struct.unpack_from("<II", data, 8)
-    if version != 5:
+    if version != 6:
         raise ValueError(f"unsupported version {version}")
     offset = 16
     (template_count,) = struct.unpack_from("<I", data, offset)
@@ -242,8 +242,8 @@ try:
             offset += vertex_count * 24
             if not all(math.isfinite(value) for value in values):
                 raise ValueError(f"{name}/{target_name}: non-finite morph data")
-        if "grip" not in names:
-            raise ValueError(f"{name}: missing Grip target")
+        if "relaxed" not in names or "grip" not in names:
+            raise ValueError(f"{name}: missing Relaxed/Grip target")
         template_vertex_counts.append(vertex_count)
         template_targets.append(names)
     (hand_animation_count,) = struct.unpack_from("<I", data, offset)

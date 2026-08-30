@@ -61,8 +61,9 @@ constexpr char data_file_name[]{"Handies.dat"};
 constexpr char ini_file_name[]{"Handies.ini"};
 constexpr char log_file_name[]{"Handies.log"};
 constexpr std::array<char, 8> data_magic{'H', 'N', 'D', '2', 'D', 'A', 'T', '\0'};
-constexpr std::uint32_t data_version{5};
+constexpr std::uint32_t data_version{6};
 constexpr float minimum_visible_animation_blend{0.01F};
+constexpr float maximum_profile_fit_rms{0.05F};
 constexpr std::uintptr_t hand_object_vtable_address{0x866EE0};
 constexpr std::uintptr_t hand_object_pre_render_slot{
     hand_object_vtable_address + 17U * sizeof(std::uintptr_t)};
@@ -463,6 +464,7 @@ public:
             next_configuration_retry_ms_ = 0;
             configured_sequence_logged_ = false;
             native_signal_logged_ = false;
+            structural_profile_logged_ = false;
             load_settings();
             install_final_render_hook();
             if (profiles_.empty() && !load_runtime_data()) {
@@ -829,6 +831,9 @@ private:
                     }
                     morph_template.targets.push_back(std::move(target));
                 }
+                if (find_morph_target(morph_template, "Relaxed") == nullptr) {
+                    return false;
+                }
                 morph_templates.push_back(std::move(morph_template));
             }
             std::uint32_t hand_animation_count{};
@@ -1037,7 +1042,73 @@ private:
                 return &profile;
             }
         }
-        return nullptr;
+
+        const RpMorphTarget* const geometry_morph{
+            RpGeometryGetMorphTarget(geometry, 0)};
+        const RwV3d* const geometry_vertices{geometry_morph != nullptr
+            ? RpMorphTargetGetVertices(geometry_morph)
+            : nullptr};
+        if (count == 0 || geometry_vertices == nullptr) return nullptr;
+
+        const RuntimeProfile* best_profile{};
+        float best_rms{std::numeric_limits<float>::max()};
+        for (const auto& profile : profiles_) {
+            if (profile.vertex_count != count) continue;
+            double squared_error{};
+            std::size_t sample_count{};
+            bool valid{true};
+            for (const RuntimeHand& hand : profile.hands) {
+                if (hand.template_index >= morph_templates_.size() ||
+                    hand.start > count || hand.count > count - hand.start) {
+                    valid = false;
+                    break;
+                }
+                const MorphTemplate& morph_template{
+                    morph_templates_[hand.template_index]};
+                const MorphTarget* const relaxed{
+                    find_morph_target(morph_template, "Relaxed")};
+                if (relaxed == nullptr || relaxed->positions.size() != hand.count) {
+                    valid = false;
+                    break;
+                }
+                for (std::uint32_t local_index{}; local_index < hand.count;
+                     ++local_index) {
+                    RwV3d expected{};
+                    RwV3dTransformPoint(
+                        &expected, &relaxed->positions[local_index],
+                        &hand.transform);
+                    const RwV3d& actual{
+                        geometry_vertices[hand.start + local_index]};
+                    const double x{static_cast<double>(actual.x - expected.x)};
+                    const double y{static_cast<double>(actual.y - expected.y)};
+                    const double z{static_cast<double>(actual.z - expected.z)};
+                    squared_error += x * x + y * y + z * z;
+                    ++sample_count;
+                }
+            }
+            if (!valid || sample_count == 0) continue;
+            const float rms{static_cast<float>(
+                std::sqrt(squared_error / static_cast<double>(sample_count)))};
+            if (rms < best_rms) {
+                best_rms = rms;
+                best_profile = &profile;
+            }
+        }
+        if (best_profile == nullptr || best_rms > maximum_profile_fit_rms) {
+            return nullptr;
+        }
+        if (!structural_profile_logged_) {
+            std::array<char, 224> message{};
+            std::snprintf(
+                message.data(), message.size(),
+                "Perfil morph recuperado por estructura: vertices=%u RMS=%.6f hashDFF=%016llX hashPerfil=%016llX.",
+                static_cast<unsigned>(count), static_cast<double>(best_rms),
+                static_cast<unsigned long long>(hash),
+                static_cast<unsigned long long>(best_profile->geometry_hash));
+            log(message.data());
+            structural_profile_logged_ = true;
+        }
+        return best_profile;
     }
 
     [[nodiscard]] PedEntry* find_entry_by_ped(CPed* ped) noexcept {
@@ -1549,6 +1620,7 @@ private:
     unsigned int next_configuration_retry_ms_{};
     bool configured_sequence_logged_{};
     bool native_signal_logged_{};
+    mutable bool structural_profile_logged_{};
 };
 
 HandiesMod handies_mod{};
