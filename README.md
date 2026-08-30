@@ -86,6 +86,18 @@ The defaults use:
 
 The script performs the complete pipeline: temporary authoring conversion, restoration of every native skeleton, structural validation, 32-bit ASI compilation, and installation.
 
+## Editable blendshape GLB
+
+The four source-hand variants and their editable profiles can be exported with Blender 5.2 or newer:
+
+```powershell
+& "C:\path\to\blender.exe" --background --factory-startup `
+  --python tools\export_blendshape_glb.py -- `
+  --output "C:\path\to\Handies_Blendshape_Profiles.glb"
+```
+
+The GLB contains `Slim_Left`, `Slim_Right`, `Fat_Left`, and `Fat_Right`. Its basis is the `Relaxed` runtime profile; the morph targets are `Grip`, right-hand `FuckU`, and the five matching `LHGsign` or `RHGsign` profiles sampled from the sustained part of their IFP sequences. UV coordinates and original template topology are preserved. `tools\validate_blendshape_glb.py` reimports the file in a clean Blender scene and checks all objects, vertex counts, UV layers, and non-empty shape keys.
+
 ## Manual geometry conversion
 
 `add_hands.py` produces the temporary authoring form used to derive runtime weights:
