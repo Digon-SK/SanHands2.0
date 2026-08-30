@@ -4,7 +4,7 @@ param(
     [string]$DragonFF = 'C:\Users\Digon\AppData\Roaming\Blender Foundation\Blender\5.2\extensions\user_default\dragonff',
     [string]$PoseSource = 'C:\Users\Digon\Documents\ChatGPT\SanHands\dist\handpose.ifp',
     [string]$GangAnimationSource = 'C:\juegos\Grand Theft Auto San Andreas\modloader\hands\ghands.ifp',
-    [string]$BlendshapeSource = 'C:\Users\Digon\Desktop\Handies_Blendshape_Profiles.glb',
+    [string]$BlendshapeSource = 'C:\Users\Digon\Desktop\ExpreSA\Handies_Blendshape_Profiles.glb',
     [string]$Blender = 'C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe',
     [string]$SourceModels = 'C:\Users\Digon\Desktop\peds',
     [string]$Hands = 'C:\Users\Digon\Desktop\hands',

@@ -80,7 +80,7 @@ The defaults use:
 - plugin-sdk: `C:\Users\Digon\Documents\Fuentes\plugin-sdk-master`
 - pose source: `C:\Users\Digon\Documents\ChatGPT\SanHands\dist\handpose.ifp`
 - gang-sign source used by the installed mod: `C:\juegos\Grand Theft Auto San Andreas\modloader\hands\ghands.ifp`
-- edited blendshape source: `C:\Users\Digon\Desktop\Handies_Blendshape_Profiles.glb`
+- edited blendshape source: `C:\Users\Digon\Desktop\ExpreSA\Handies_Blendshape_Profiles.glb`
 - Blender: `C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe`
 - Original peds: `C:\Users\Digon\Desktop\peds`
 - Native articulated hands: `C:\Users\Digon\Desktop\hands`

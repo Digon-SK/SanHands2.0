@@ -576,16 +576,7 @@ private:
             CAnimManager::ms_numAnimAssocDefinitions,
             0, maximum_animation_groups)};
         const auto add_for_group = [&](int group) {
-            if (group < 0 || group >= group_count ||
-                CAnimManager::ms_aAnimAssocGroups == nullptr) {
-                return;
-            }
-            const CAnimBlendAssocGroup& assoc_group{
-                CAnimManager::ms_aAnimAssocGroups[group]};
-            if (assoc_group.m_pAssociations == nullptr ||
-                assoc_group.m_nNumAnimations == 0) {
-                return;
-            }
+            if (group < 0 || group >= group_count) return;
             CAnimBlendStaticAssociation* const association{
                 CAnimManager::GetAnimAssociation(
                     group, animation_name.c_str())};
