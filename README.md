@@ -12,10 +12,11 @@ The generated DFFs contain the replacement hand geometry, closed wrist seams, co
 - Restores the original 32-node HAnim hierarchy and 32-bone Skin PLG before writing each final DFF.
 - Keeps GTA's normal walk, fight, weapon, gesture, and body animation associations at 32 frames.
 - Builds a geometry-specific hand profile containing its finger vertex mask, gang-hand weights, bind matrices, offsets, and base normals.
-- Evaluates `relaxed`, `grip/fist`, `FUCKU`, and the ten original gang-sign tracks from the installed `ghands.ifp` as morph shapes.
+- Imports every animation in `ghands.ifp` that contains the complete 15-track finger rig as a named hand sequence.
+- Selects those sequences through configurable hand profiles mapped to live ped animation associations.
 - Applies the selected morph to the shared hand vertices immediately before `RpClumpRender`, renders through the untouched native 32-bone Skin, and restores the base vertices immediately afterward.
 - Never creates a 62-node runtime hierarchy, swaps HAnim owners, or changes `CAnimBlendClumpData`, `finger`, or `finger01`.
-- Uses the active native hand-signal task's animation ID and playback time, while suppressing only its separate replacement-hand render pass.
+- Uses the active ped association's real group, animation ID, playback time, blend amount, and configurable priority, while suppressing only the native separate replacement-hand render pass.
 - Copies TXD files byte-for-byte.
 
 `player.dff` is copied unchanged because CJ uses a modular body assembled from `player.img` rather than a conventional pedestrian mesh.
@@ -25,11 +26,42 @@ The generated DFFs contain the replacement hand geometry, closed wrist seams, co
 The installed mod consists of:
 
 - `Handies.asi`: render-time hand-profile blending and finger animation.
-- `Handies.dat`: geometry-specific morph masks, source gang-hand weights, inverse bind matrices, finger offsets, and sampled hand poses.
-- `Handies.ini`: enable/player/NPC and transition-speed settings.
+- `Handies.dat`: geometry-specific morph masks plus all named finger sequences sampled from the hand IFP.
+- `Handies.ini`: enable/player/NPC settings, hand-sequence profiles, and ped-animation mappings.
 - Final DFF/TXD files: hand geometry with the native skeleton only.
 
-No IFP is installed. The finger rotations required by the mod are sampled into `Handies.dat` during the local build.
+The source IFP remains `modloader\hands\ghands.ifp`; Handies does not register a second animation block in GTA. During the build, each complete finger animation is compiled into `Handies.dat` under its original IFP name. Changing only profile mappings does not require rebuilding; adding or editing an IFP sequence does.
+
+## Hand sequence profiles
+
+Each `[HandProfile.Name]` section chooses one IFP sequence per side:
+
+```ini
+[HandProfile.MyGesture]
+Left=LHGsign1
+Right=RHGsign1
+TimeMode=Seconds
+Loop=0
+Speed=1.0
+Weight=1.0
+Priority=100
+```
+
+- `Left` and `Right` are animation names from `ghands.ifp`; use `None` to leave one side on the automatic relaxed/fist pose.
+- `TimeMode=Seconds` follows the IFP sequence's natural timeline from the active body association.
+- `TimeMode=Ped` maps the normalized duration of the body animation to the whole hand sequence.
+- `Loop`, `Speed`, and `Weight` control playback; `Priority` chooses between simultaneous matching body associations.
+
+`[PedAnimationMappings]` maps an animation group or IFP block plus animation name to a profile:
+
+```ini
+[PedAnimationMappings]
+handsignal.gsign1=MyGesture
+ped.ifp.FUCKU=MyOtherGesture
+*.some_animation=SharedGesture
+```
+
+Matching is case-insensitive. `group.animation` targets one association group, `block.ifp.animation` targets every group backed by that IFP block, and `*` targets every group containing that animation. The included INI defines the ten native left/both-hands gang-sign mappings.
 
 Disable the older `SanHands.asi` while using this version. The old implementation creates separate replacement hand objects and is incompatible with embedded hand geometry.
 

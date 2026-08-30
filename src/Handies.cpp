@@ -11,6 +11,9 @@
 #include "AnimBlendFrameData.h"
 #include "CAnimBlendAssociation.h"
 #include "CAnimBlendClumpData.h"
+#include "CAnimBlendHierarchy.h"
+#include "CAnimBlendStaticAssociation.h"
+#include "CAnimManager.h"
 #include "CHandObject.h"
 #include "CPed.h"
 #include "CPedIntelligence.h"
@@ -33,11 +36,16 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
+#include <string>
+#include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace handies {
@@ -50,14 +58,15 @@ constexpr int native_bone_count{32};
 constexpr int runtime_bone_count{62};
 constexpr int finger_bones_per_hand{15};
 constexpr int pose_count{3};
-constexpr int hand_signal_count{5};
+constexpr int native_hand_signal_count{5};
+constexpr int maximum_animation_groups{139};
 constexpr int left_hand_id{34};
 constexpr int right_hand_id{24};
 constexpr char data_file_name[]{"Handies.dat"};
 constexpr char ini_file_name[]{"Handies.ini"};
 constexpr char log_file_name[]{"Handies.log"};
 constexpr std::array<char, 8> data_magic{'H', 'N', 'D', '2', 'D', 'A', 'T', '\0'};
-constexpr std::uint32_t data_version{3};
+constexpr std::uint32_t data_version{4};
 constexpr float minimum_visible_animation_blend{0.01F};
 constexpr std::uintptr_t hand_object_vtable_address{0x866EE0};
 constexpr std::uintptr_t hand_object_pre_render_slot{
@@ -95,14 +104,33 @@ struct FingerTrack {
     std::vector<FingerKey> keys{};
 };
 
-struct HandSignalAnimation {
+struct HandAnimation {
+    std::string name{};
     float duration{};
     std::array<FingerTrack, finger_bones_per_hand> tracks{};
 };
 
-using HandSignalTable = std::array<
-    std::array<HandSignalAnimation, hand_signal_count>,
-    2>;
+struct HandSequenceProfile {
+    std::string name{};
+    int left_animation{-1};
+    int right_animation{-1};
+    bool sync_to_ped{true};
+    bool loop{};
+    float speed{1.0F};
+    float weight{1.0F};
+    int priority{};
+};
+
+struct PedAnimationMapping {
+    unsigned short group{};
+    short animation{};
+    std::size_t profile_index{};
+};
+
+struct ActiveHandSequence {
+    const HandSequenceProfile* profile{};
+    const CAnimBlendAssociation* association{};
+};
 
 struct HandSignalState {
     int animation_index{-1};
@@ -225,6 +253,60 @@ private:
     return parse_end != value_text.data() ? parsed : fallback;
 }
 
+[[nodiscard]] std::string read_ini_string(
+    const char* path,
+    const char* section,
+    const char* key,
+    const char* fallback = "") {
+    std::array<char, 256> value{};
+    GetPrivateProfileStringA(
+        section, key, fallback, value.data(),
+        static_cast<DWORD>(value.size()), path);
+    return value.data();
+}
+
+[[nodiscard]] std::string trim_copy(std::string_view value) {
+    const auto first{value.find_first_not_of(" \t\r\n")};
+    if (first == std::string_view::npos) return {};
+    const auto last{value.find_last_not_of(" \t\r\n")};
+    return std::string{value.substr(first, last - first + 1)};
+}
+
+[[nodiscard]] bool equals_ignore_case(
+    std::string_view first,
+    std::string_view second) noexcept {
+    if (first.size() != second.size()) return false;
+    for (std::size_t index{}; index < first.size(); ++index) {
+        const unsigned char a{static_cast<unsigned char>(first[index])};
+        const unsigned char b{static_cast<unsigned char>(second[index])};
+        if (std::tolower(a) != std::tolower(b)) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] float parse_float(
+    const std::string& value,
+    float fallback) noexcept {
+    char* parse_end{};
+    const float parsed{std::strtof(value.c_str(), &parse_end)};
+    return parse_end != value.c_str() && std::isfinite(parsed)
+        ? parsed
+        : fallback;
+}
+
+[[nodiscard]] int parse_int(
+    const std::string& value,
+    int fallback) noexcept {
+    char* parse_end{};
+    const long parsed{std::strtol(value.c_str(), &parse_end, 10)};
+    if (parse_end == value.c_str() ||
+        parsed < std::numeric_limits<int>::min() ||
+        parsed > std::numeric_limits<int>::max()) {
+        return fallback;
+    }
+    return static_cast<int>(parsed);
+}
+
 [[nodiscard]] constexpr float smoothstep(float value) noexcept {
     const float clamped{std::clamp(value, 0.0F, 1.0F)};
     return clamped * clamped * (3.0F - 2.0F * clamped);
@@ -281,7 +363,7 @@ private:
     const int animation_index{
         signal->hand_animation_id - static_cast<int>(ANIM_HANDSIGNAL_GSIGN1)};
     if (association == nullptr || animation_index < 0 ||
-        animation_index >= hand_signal_count ||
+        animation_index >= native_hand_signal_count ||
         association->m_fBlendAmount <= minimum_visible_animation_blend) {
         return result;
     }
@@ -419,6 +501,7 @@ public:
                 log("ERROR: Handies.dat sigue sin estar disponible al iniciar partida.");
             } else {
                 install_hand_object_hooks();
+                load_sequence_configuration();
             }
         };
         plugin::Events::gameProcessEvent += [this] { on_game_process(); };
@@ -484,6 +567,176 @@ private:
             0.01F, 1.0F);
     }
 
+    [[nodiscard]] int find_hand_animation_index(
+        std::string_view name) const noexcept {
+        if (name.empty() || equals_ignore_case(name, "none")) return -1;
+        for (std::size_t index{}; index < hand_animations_.size(); ++index) {
+            if (equals_ignore_case(hand_animations_[index].name, name)) {
+                return static_cast<int>(index);
+            }
+        }
+        return -1;
+    }
+
+    [[nodiscard]] std::size_t find_sequence_profile_index(
+        std::string_view name) const noexcept {
+        for (std::size_t index{}; index < sequence_profiles_.size(); ++index) {
+            if (equals_ignore_case(sequence_profiles_[index].name, name)) {
+                return index;
+            }
+        }
+        return sequence_profiles_.size();
+    }
+
+    void add_animation_mappings(
+        std::string_view source_text,
+        std::size_t profile_index) {
+        const std::string source{trim_copy(source_text)};
+        const auto separator{source.rfind('.')};
+        if (separator == std::string::npos || separator == 0 ||
+            separator + 1 >= source.size()) {
+            return;
+        }
+        std::string owner{trim_copy(std::string_view{source}.substr(0, separator))};
+        const std::string animation_name{
+            trim_copy(std::string_view{source}.substr(separator + 1))};
+        if (owner.size() > 4 && equals_ignore_case(
+                std::string_view{owner}.substr(owner.size() - 4), ".ifp")) {
+            owner.resize(owner.size() - 4);
+        }
+        const int group_count{std::clamp(
+            CAnimManager::ms_numAnimAssocDefinitions,
+            0, maximum_animation_groups)};
+        for (int group{}; group < group_count; ++group) {
+            const CAnimBlendAssocGroup& assoc_group{
+                CAnimManager::ms_aAnimAssocGroups[group]};
+            if (assoc_group.m_pAssociations == nullptr ||
+                assoc_group.m_nNumAnimations == 0) {
+                continue;
+            }
+            const char* const group_name{CAnimManager::GetAnimGroupName(group)};
+            const char* const block_name{CAnimManager::GetAnimBlockName(group)};
+            const bool owner_matches{owner == "*" ||
+                (group_name != nullptr && equals_ignore_case(owner, group_name)) ||
+                (block_name != nullptr && equals_ignore_case(owner, block_name))};
+            if (!owner_matches) continue;
+
+            CAnimBlendStaticAssociation* const association{
+                CAnimManager::GetAnimAssociation(group, animation_name.c_str())};
+            if (association == nullptr) continue;
+            const auto duplicate{std::find_if(
+                animation_mappings_.begin(), animation_mappings_.end(),
+                [association](const PedAnimationMapping& mapping) {
+                    return mapping.group == association->m_nAnimGroup &&
+                           mapping.animation == association->m_nAnimId;
+                })};
+            if (duplicate != animation_mappings_.end()) {
+                duplicate->profile_index = profile_index;
+            } else {
+                animation_mappings_.push_back({
+                    association->m_nAnimGroup,
+                    association->m_nAnimId,
+                    profile_index});
+            }
+        }
+    }
+
+    void load_sequence_configuration() {
+        sequence_profiles_.clear();
+        animation_mappings_.clear();
+        if (hand_animations_.empty()) return;
+
+        std::array<char, 32768> section_names{};
+        const DWORD section_length{GetPrivateProfileSectionNamesA(
+            section_names.data(), static_cast<DWORD>(section_names.size()),
+            ini_path_.data())};
+        if (section_length == 0 ||
+            section_length >= section_names.size() - 2) {
+            log("ADVERTENCIA: no se pudieron enumerar los perfiles de manos del INI.");
+            return;
+        }
+        constexpr std::string_view profile_prefix{"HandProfile."};
+        for (const char* section{section_names.data()}; *section != '\0';
+             section += std::strlen(section) + 1) {
+            const std::string_view section_name{section};
+            if (section_name.size() <= profile_prefix.size() ||
+                !equals_ignore_case(
+                    section_name.substr(0, profile_prefix.size()),
+                    profile_prefix)) {
+                continue;
+            }
+            HandSequenceProfile profile{};
+            profile.name = trim_copy(section_name.substr(profile_prefix.size()));
+            const std::string left_name{trim_copy(read_ini_string(
+                ini_path_.data(), section, "Left", "None"))};
+            const std::string right_name{trim_copy(read_ini_string(
+                ini_path_.data(), section, "Right", "None"))};
+            profile.left_animation = find_hand_animation_index(left_name);
+            profile.right_animation = find_hand_animation_index(right_name);
+            if ((!equals_ignore_case(left_name, "none") &&
+                 profile.left_animation < 0) ||
+                (!equals_ignore_case(right_name, "none") &&
+                 profile.right_animation < 0)) {
+                std::array<char, 256> message{};
+                std::snprintf(
+                    message.data(), message.size(),
+                    "Perfil %s omitido: secuencia IFP Left=%s Right=%s no disponible.",
+                    profile.name.c_str(), left_name.c_str(), right_name.c_str());
+                log(message.data());
+                continue;
+            }
+            if (profile.left_animation < 0 && profile.right_animation < 0) {
+                continue;
+            }
+            const std::string sync_mode{read_ini_string(
+                ini_path_.data(), section, "TimeMode", "Ped")};
+            profile.sync_to_ped = !equals_ignore_case(
+                trim_copy(sync_mode), "Seconds");
+            profile.loop = parse_int(read_ini_string(
+                ini_path_.data(), section, "Loop", "0"), 0) != 0;
+            profile.speed = std::clamp(parse_float(read_ini_string(
+                ini_path_.data(), section, "Speed", "1.0"), 1.0F),
+                0.01F, 20.0F);
+            profile.weight = std::clamp(parse_float(read_ini_string(
+                ini_path_.data(), section, "Weight", "1.0"), 1.0F),
+                0.0F, 1.0F);
+            profile.priority = std::clamp(parse_int(read_ini_string(
+                ini_path_.data(), section, "Priority", "0"), 0),
+                -10000, 10000);
+            sequence_profiles_.push_back(std::move(profile));
+        }
+
+        std::array<char, 32768> mapping_entries{};
+        const DWORD mapping_length{GetPrivateProfileSectionA(
+            "PedAnimationMappings", mapping_entries.data(),
+            static_cast<DWORD>(mapping_entries.size()), ini_path_.data())};
+        if (mapping_length > 0 && mapping_length < mapping_entries.size() - 2) {
+            for (const char* item{mapping_entries.data()}; *item != '\0';
+                 item += std::strlen(item) + 1) {
+                const std::string_view entry{item};
+                const auto equals{entry.find('=')};
+                if (equals == std::string_view::npos) continue;
+                const std::string source{trim_copy(entry.substr(0, equals))};
+                const std::string profile_name{trim_copy(entry.substr(equals + 1))};
+                const std::size_t profile_index{
+                    find_sequence_profile_index(profile_name)};
+                if (profile_index >= sequence_profiles_.size()) {
+                    continue;
+                }
+                add_animation_mappings(source, profile_index);
+            }
+        }
+
+        std::array<char, 192> message{};
+        std::snprintf(
+            message.data(), message.size(),
+            "Secuencias configurables: IFP=%u perfiles=%u asociaciones PED=%u.",
+            static_cast<unsigned int>(hand_animations_.size()),
+            static_cast<unsigned int>(sequence_profiles_.size()),
+            static_cast<unsigned int>(animation_mappings_.size()));
+        log(message.data());
+    }
+
     void log(const char* message) const noexcept {
         OutputDebugStringA("Handies: ");
         OutputDebugStringA(message);
@@ -545,42 +798,61 @@ private:
                     }
                 }
             }
-            HandSignalTable hand_signals{};
-            for (auto& side : hand_signals) {
-                for (auto& animation : side) {
-                    if (!reader.read(animation.duration) ||
-                        !std::isfinite(animation.duration) ||
-                        animation.duration <= 0.0F || animation.duration > 30.0F) {
+            std::uint32_t hand_animation_count{};
+            if (!reader.read(hand_animation_count) || hand_animation_count == 0 ||
+                hand_animation_count > 256) {
+                return false;
+            }
+            std::vector<HandAnimation> hand_animations{};
+            hand_animations.reserve(hand_animation_count);
+            for (std::uint32_t animation_index{};
+                 animation_index < hand_animation_count; ++animation_index) {
+                HandAnimation animation{};
+                std::uint32_t name_length{};
+                if (!reader.read(name_length) || name_length == 0 ||
+                    name_length > 63) {
+                    return false;
+                }
+                animation.name.resize(name_length);
+                if (!reader.read_bytes(animation.name.data(), name_length) ||
+                    !reader.read(animation.duration) ||
+                    !std::isfinite(animation.duration) ||
+                    animation.duration <= 0.0F || animation.duration > 30.0F) {
+                    return false;
+                }
+                for (const auto& previous : hand_animations) {
+                    if (equals_ignore_case(previous.name, animation.name)) {
                         return false;
                     }
-                    for (auto& track : animation.tracks) {
-                        std::uint32_t key_count{};
-                        if (!reader.read(key_count) || key_count == 0 || key_count > 64) {
+                }
+                for (auto& track : animation.tracks) {
+                    std::uint32_t key_count{};
+                    if (!reader.read(key_count) || key_count == 0 || key_count > 64) {
+                        return false;
+                    }
+                    track.keys.resize(key_count);
+                    float previous_time{-1.0F};
+                    for (auto& key : track.keys) {
+                        std::array<float, 4> packed{};
+                        if (!reader.read(key.time) || !reader.read(packed) ||
+                            !std::isfinite(key.time) || key.time < previous_time ||
+                            key.time < 0.0F ||
+                            key.time > animation.duration + 1.0e-4F) {
                             return false;
                         }
-                        track.keys.resize(key_count);
-                        float previous_time{-1.0F};
-                        for (auto& key : track.keys) {
-                            std::array<float, 4> packed{};
-                            if (!reader.read(key.time) || !reader.read(packed) ||
-                                !std::isfinite(key.time) || key.time < previous_time ||
-                                key.time < 0.0F ||
-                                key.time > animation.duration + 1.0e-4F) {
-                                return false;
-                            }
-                            key.rotation.imag = {packed[0], packed[1], packed[2]};
-                            key.rotation.real = packed[3];
-                            const float length_squared{
-                                packed[0] * packed[0] + packed[1] * packed[1] +
-                                packed[2] * packed[2] + packed[3] * packed[3]};
-                            if (!std::isfinite(length_squared) ||
-                                std::abs(length_squared - 1.0F) > 0.01F) {
-                                return false;
-                            }
-                            previous_time = key.time;
+                        key.rotation.imag = {packed[0], packed[1], packed[2]};
+                        key.rotation.real = packed[3];
+                        const float length_squared{
+                            packed[0] * packed[0] + packed[1] * packed[1] +
+                            packed[2] * packed[2] + packed[3] * packed[3]};
+                        if (!std::isfinite(length_squared) ||
+                            std::abs(length_squared - 1.0F) > 0.01F) {
+                            return false;
                         }
+                        previous_time = key.time;
                     }
                 }
+                hand_animations.push_back(std::move(animation));
             }
             std::vector<RuntimeProfile> profiles{};
             profiles.reserve(profile_count);
@@ -626,7 +898,7 @@ private:
             }
             if (reader.remaining() != 0) return false;
             poses_ = poses;
-            hand_signals_ = std::move(hand_signals);
+            hand_animations_ = std::move(hand_animations);
             profiles_ = std::move(profiles);
             return true;
         } catch (...) {
@@ -980,6 +1252,62 @@ private:
         entry.grip += std::clamp(target_grip - entry.grip, -grip_step, grip_step);
     }
 
+    [[nodiscard]] ActiveHandSequence find_active_hand_sequence(
+        const CPed& ped) const noexcept {
+        ActiveHandSequence result{};
+        if (ped.m_pRwClump == nullptr || animation_mappings_.empty()) {
+            return result;
+        }
+        int selected_priority{std::numeric_limits<int>::min()};
+        float selected_blend{-1.0F};
+        for (CAnimBlendAssociation* association{
+                 RpAnimBlendClumpGetFirstAssociation(ped.m_pRwClump)};
+             association != nullptr;
+             association = RpAnimBlendGetNextAssociation(association)) {
+            if (association->m_fBlendAmount <= minimum_visible_animation_blend) {
+                continue;
+            }
+            for (const auto& mapping : animation_mappings_) {
+                if (mapping.group != association->m_nAnimGroup ||
+                    mapping.animation != association->m_nAnimId ||
+                    mapping.profile_index >= sequence_profiles_.size()) {
+                    continue;
+                }
+                const HandSequenceProfile& profile{
+                    sequence_profiles_[mapping.profile_index]};
+                if (profile.priority > selected_priority ||
+                    (profile.priority == selected_priority &&
+                     association->m_fBlendAmount > selected_blend)) {
+                    result.profile = &profile;
+                    result.association = association;
+                    selected_priority = profile.priority;
+                    selected_blend = association->m_fBlendAmount;
+                }
+            }
+        }
+        return result;
+    }
+
+    [[nodiscard]] static float sequence_time(
+        const HandAnimation& animation,
+        const HandSequenceProfile& profile,
+        const CAnimBlendAssociation& association) noexcept {
+        float time{};
+        if (profile.sync_to_ped && association.m_pHierarchy != nullptr &&
+            association.m_pHierarchy->m_fTotalTime > 1.0e-6F) {
+            const float progress{std::max(association.m_fCurrentTime, 0.0F) /
+                association.m_pHierarchy->m_fTotalTime};
+            time = progress * animation.duration * profile.speed;
+        } else {
+            time = std::max(association.m_fCurrentTime, 0.0F) * profile.speed;
+        }
+        if (profile.loop && animation.duration > 1.0e-6F) {
+            const float wrapped{std::fmod(time, animation.duration)};
+            return wrapped >= 0.0F ? wrapped : wrapped + animation.duration;
+        }
+        return std::clamp(time, 0.0F, animation.duration);
+    }
+
     [[nodiscard]] PedEntry* prepare_for_clump_render(RpClump* clump) noexcept {
         PedEntry* entry{find_entry_by_clump(clump)};
         if (entry == nullptr) {
@@ -992,6 +1320,9 @@ private:
     }
 
     void apply_finger_matrices(PedEntry& entry) noexcept {
+        const ActiveHandSequence configured_sequence{entry.ped != nullptr
+            ? find_active_hand_sequence(*entry.ped)
+            : ActiveHandSequence{}};
         const HandSignalState signal{entry.ped != nullptr
             ? read_hand_signal_state(*entry.ped)
             : HandSignalState{}};
@@ -1041,17 +1372,51 @@ private:
                             rotation, poses_[side][2][finger_index],
                             smoothstep(entry.fucku_blend));
                     }
-                    const bool signal_active{
+                    bool configured_side_active{};
+                    if (configured_sequence.profile != nullptr &&
+                        configured_sequence.association != nullptr) {
+                        const int animation_index{side == 0
+                            ? configured_sequence.profile->left_animation
+                            : configured_sequence.profile->right_animation};
+                        if (animation_index >= 0 &&
+                            static_cast<std::size_t>(animation_index) <
+                                hand_animations_.size()) {
+                            const HandAnimation& animation{
+                                hand_animations_[static_cast<std::size_t>(
+                                    animation_index)]};
+                            const RtQuat sampled{sample_track(
+                                animation.tracks[finger_index],
+                                sequence_time(
+                                    animation, *configured_sequence.profile,
+                                    *configured_sequence.association))};
+                            const float blend{std::clamp(
+                                configured_sequence.association->m_fBlendAmount *
+                                    configured_sequence.profile->weight,
+                                0.0F, 1.0F)};
+                            rotation = normalized_lerp(rotation, sampled, blend);
+                            configured_side_active = true;
+                        }
+                    }
+                    const bool signal_active{!configured_side_active &&
                         signal.animation_index >= 0 &&
                         ((side == 0 && signal.left) ||
                          (side == 1 && signal.right))};
                     if (signal_active) {
-                        const HandSignalAnimation& animation{
-                            hand_signals_[side][static_cast<std::size_t>(
-                                signal.animation_index)]};
-                        rotation = sample_track(
-                            animation.tracks[finger_index],
-                            std::min(signal.time, animation.duration));
+                        std::array<char, 16> animation_name{};
+                        std::snprintf(
+                            animation_name.data(), animation_name.size(),
+                            "%cHGsign%d", side == 0 ? 'L' : 'R',
+                            signal.animation_index + 1);
+                        const int fallback_index{
+                            find_hand_animation_index(animation_name.data())};
+                        if (fallback_index >= 0) {
+                            const HandAnimation& animation{
+                                hand_animations_[static_cast<std::size_t>(
+                                    fallback_index)]};
+                            rotation = sample_track(
+                                animation.tracks[finger_index],
+                                std::min(signal.time, animation.duration));
+                        }
                     }
                     RwMatrix local{};
                     RtQuatConvertToMatrix(&rotation, &local);
@@ -1214,7 +1579,9 @@ private:
 
     Settings settings_{};
     PoseTable poses_{};
-    HandSignalTable hand_signals_{};
+    std::vector<HandAnimation> hand_animations_{};
+    std::vector<HandSequenceProfile> sequence_profiles_{};
+    std::vector<PedAnimationMapping> animation_mappings_{};
     std::vector<RuntimeProfile> profiles_{};
     std::array<PedEntry, max_tracked_peds> entries_{};
     std::array<char, MAX_PATH> ini_path_{};

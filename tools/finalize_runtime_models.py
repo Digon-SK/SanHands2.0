@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 MAGIC = b"HND2DAT\0"
-VERSION = 3
+VERSION = 4
 NATIVE_BONES = 32
 RUNTIME_BONES = 62
 FINGER_IDS = tuple(range(3, 18))
@@ -108,8 +108,8 @@ def load_pose_table(pose_source: Path, rwfury_root: Path):
     return tuple(result)
 
 
-def load_hand_signal_table(gang_source: Path, rwfury_root: Path):
-    """Load the original left/right gang-sign finger tracks without the wrists."""
+def load_hand_animation_table(gang_source: Path, rwfury_root: Path):
+    """Load every named IFP sequence containing the complete finger rig."""
     sys.path.insert(0, str(rwfury_root.resolve()))
     from rwfury import Ifp
 
@@ -118,35 +118,39 @@ def load_hand_signal_table(gang_source: Path, rwfury_root: Path):
         raise ValueError(f"{gang_source}: expected the GHANDS animation package")
 
     result = []
-    for side in ("L", "R"):
-        side_animations = []
-        for signal_index in range(1, 6):
-            animation_name = f"{side}HGsign{signal_index}"
-            animation = package.get_animation(animation_name)
-            if animation is None:
-                raise ValueError(f"Missing animation {animation_name}")
-            by_id = {obj.bone_id: obj for obj in animation.objects}
-            if not all(bone_id in by_id for bone_id in FINGER_IDS):
-                raise ValueError(f"{animation_name}: incomplete finger tracks")
+    names = set()
+    for animation in package.animations:
+        by_id = {obj.bone_id: obj for obj in animation.objects}
+        if not all(bone_id in by_id for bone_id in FINGER_IDS):
+            continue
+        encoded_name = animation.name.encode("ascii")
+        if not encoded_name or len(encoded_name) > 63:
+            raise ValueError(f"Invalid hand animation name {animation.name!r}")
+        folded_name = animation.name.casefold()
+        if folded_name in names:
+            raise ValueError(f"Duplicate hand animation {animation.name}")
+        names.add(folded_name)
 
-            tracks = []
-            duration = 0.0
-            for bone_id in FINGER_IDS:
-                frames = sorted(by_id[bone_id].frames, key=lambda frame: frame.time)
-                if not frames or len(frames) > 64:
-                    raise ValueError(
-                        f"{animation_name}: invalid key count for bone {bone_id}"
-                    )
-                keys = tuple(
-                    (float(frame.time), normalize_quaternion(tuple(frame.rotation)))
-                    for frame in frames
+        tracks = []
+        duration = 0.0
+        for bone_id in FINGER_IDS:
+            frames = sorted(by_id[bone_id].frames, key=lambda frame: frame.time)
+            if not frames or len(frames) > 64:
+                raise ValueError(
+                    f"{animation.name}: invalid key count for bone {bone_id}"
                 )
-                duration = max(duration, keys[-1][0])
-                tracks.append(keys)
-            if duration <= 0.0:
-                raise ValueError(f"{animation_name}: invalid duration")
-            side_animations.append((duration, tuple(tracks)))
-        result.append(tuple(side_animations))
+            keys = tuple(
+                (float(frame.time), normalize_quaternion(tuple(frame.rotation)))
+                for frame in frames
+            )
+            duration = max(duration, keys[-1][0])
+            tracks.append(keys)
+        if duration <= 0.0 or duration > 30.0:
+            raise ValueError(f"{animation.name}: invalid duration {duration}")
+        result.append((animation.name, duration, tuple(tracks)))
+
+    if not result:
+        raise ValueError(f"{gang_source}: no complete finger animation sequences")
     return tuple(result)
 
 
@@ -306,20 +310,23 @@ def restore_native_skeleton(expanded_clump, native_clump):
     expanded_clump.frame_list = copy.deepcopy(native_clump.frame_list)
 
 
-def write_runtime_data(path: Path, poses, hand_signals, profiles):
+def write_runtime_data(path: Path, poses, hand_animations, profiles):
     data = bytearray(MAGIC)
     data += struct.pack("<II", VERSION, len(profiles))
     for side in poses:
         for pose in side:
             for quaternion in pose:
                 data += struct.pack("<4f", *quaternion)
-    for side in hand_signals:
-        for duration, tracks in side:
-            data += struct.pack("<f", duration)
-            for track in tracks:
-                data += struct.pack("<I", len(track))
-                for time, quaternion in track:
-                    data += struct.pack("<5f", time, *quaternion)
+    data += struct.pack("<I", len(hand_animations))
+    for name, duration, tracks in hand_animations:
+        encoded_name = name.encode("ascii")
+        data += struct.pack("<I", len(encoded_name))
+        data += encoded_name
+        data += struct.pack("<f", duration)
+        for track in tracks:
+            data += struct.pack("<I", len(track))
+            for time, quaternion in track:
+                data += struct.pack("<5f", time, *quaternion)
     for profile in profiles:
         data += struct.pack(
             "<QII", profile.geometry_hash, profile.vertex_count, RUNTIME_BONES
@@ -360,7 +367,7 @@ def main() -> int:
     from gtaLib.dff import dff
 
     poses = load_pose_table(args.pose_source, args.rwfury_root)
-    hand_signals = load_hand_signal_table(args.gang_source, args.rwfury_root)
+    hand_animations = load_hand_animation_table(args.gang_source, args.rwfury_root)
     args.output.mkdir(parents=True, exist_ok=True)
     profiles_by_hash = {}
     count = 0
@@ -410,9 +417,10 @@ def main() -> int:
         (args.output / txd_path.name).write_bytes(txd_path.read_bytes())
 
     profiles = tuple(profiles_by_hash.values())
-    write_runtime_data(args.data, poses, hand_signals, profiles)
+    write_runtime_data(args.data, poses, hand_animations, profiles)
     print(
         f"Runtime DFF={count} profiles={len(profiles)} "
+        f"hand_sequences={len(hand_animations)} "
         f"data={args.data} ({args.data.stat().st_size} bytes)"
     )
     return 0
