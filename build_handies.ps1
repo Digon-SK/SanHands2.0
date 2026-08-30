@@ -119,4 +119,4 @@ $ModelFiles | Copy-Item -Destination $InstallDir -Force
 
 Write-Host "Handies compilado e instalado en $InstallDir"
 Write-Host "DFF nativos con geometría nueva: $DffCount; TXD: $TxdCount"
-Write-Host "Los 30 huesos de dedos se agregan únicamente en memoria por Handies.asi"
+Write-Host "Los huesos GHANDS generan perfiles morph; el juego conserva sólo sus 32 huesos"

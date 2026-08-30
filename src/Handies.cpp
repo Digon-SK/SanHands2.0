@@ -1,10 +1,9 @@
 /*
     Handies - runtime animated fingers for GTA San Andreas pedestrians.
 
-    DFF files retain the native 32-node ped hierarchy. After GTA completes its
-    normal animation setup, this plugin gives each ped a private geometry and
-    appends 30 runtime-only finger nodes. GTA continues animating only its
-    original 32 frames; Handies evaluates the fingers only for the skin render.
+    DFF files retain the native 32-node ped hierarchy. Handies evaluates
+    per-hand morph profiles derived from the original GHANDS finger rigs and
+    applies them only around each draw. No finger node enters GTA's HAnim.
 */
 
 #include "plugin.h"
@@ -44,7 +43,6 @@
 namespace handies {
 namespace {
 
-constexpr std::uintptr_t update_animations_call_address{0x535F94};
 constexpr std::uintptr_t entity_render_clump_call_address{0x53439C};
 constexpr std::size_t max_tracked_peds{256};
 constexpr std::size_t max_atomics_per_ped{16};
@@ -55,8 +53,6 @@ constexpr int pose_count{3};
 constexpr int hand_signal_count{5};
 constexpr int left_hand_id{34};
 constexpr int right_hand_id{24};
-constexpr int left_extra_id_base{1003};
-constexpr int right_extra_id_base{1103};
 constexpr char data_file_name[]{"Handies.dat"};
 constexpr char ini_file_name[]{"Handies.ini"};
 constexpr char log_file_name[]{"Handies.log"};
@@ -139,13 +135,15 @@ static_assert(offsetof(NativeHandSignalTaskView, right_hand) == 0x20);
 
 struct RuntimeBinding {
     RpHAnimHierarchy* source_hierarchy{};
-    RpHAnimHierarchy* render_hierarchy{};
     const RuntimeProfile* profile{};
+    std::array<RwMatrix, runtime_bone_count> pose_matrices{};
 };
 
 struct RuntimeAtomic {
     RpAtomic* atomic{};
     std::size_t binding_index{};
+    std::vector<RwV3d> base_vertices{};
+    std::vector<RwV3d> base_normals{};
 };
 
 struct PedEntry {
@@ -165,15 +163,8 @@ struct AtomicList {
     bool overflow{};
 };
 
-struct PreparedAtomic {
-    RpAtomic* atomic{};
-    RpGeometry* geometry{};
-    std::size_t binding_index{};
-};
-
 struct HierarchyPlan {
-    RpHAnimHierarchy* old_hierarchy{};
-    RpHAnimHierarchy* new_hierarchy{};
+    RpHAnimHierarchy* source_hierarchy{};
     const RuntimeProfile* profile{};
 };
 
@@ -365,10 +356,6 @@ private:
     return track.keys.back().rotation;
 }
 
-[[nodiscard]] int target_bone_id(int side, int source_id) noexcept {
-    return (side == 0 ? 1000 : 1100) + source_id;
-}
-
 [[nodiscard]] int parent_source_id(int source_id) noexcept {
     switch (source_id) {
     case 3:
@@ -409,98 +396,6 @@ RpAtomic* collect_atomic(RpAtomic* atomic, void* data) noexcept {
     return value;
 }
 
-[[nodiscard]] RpGeometry* clone_geometry(const RpGeometry* source) {
-    if (source == nullptr) return nullptr;
-    const RwInt32 vertex_count{RpGeometryGetNumVertices(source)};
-    const RwInt32 triangle_count{RpGeometryGetNumTriangles(source)};
-    const RwInt32 morph_count{RpGeometryGetNumMorphTargets(source)};
-    const RwInt32 texcoord_count{RpGeometryGetNumTexCoordSets(source)};
-    if (vertex_count <= 0 || triangle_count <= 0 || morph_count <= 0 ||
-        texcoord_count < 0 || texcoord_count > rwMAXTEXTURECOORDS) {
-        return nullptr;
-    }
-    const RwUInt32 format{
-        (RpGeometryGetFlags(source) & rpGEOMETRYFLAGSMASK) |
-        rpGEOMETRYTEXCOORDSETS(static_cast<RwUInt32>(texcoord_count))};
-    RpGeometry* clone{RpGeometryCreate(vertex_count, triangle_count, format)};
-    if (clone == nullptr) return nullptr;
-    if (morph_count > 1 &&
-        RpGeometryAddMorphTargets(clone, morph_count - 1) < 0) {
-        RpGeometryDestroy(clone);
-        return nullptr;
-    }
-
-    for (RwInt32 morph_index{}; morph_index < morph_count; ++morph_index) {
-        const RpMorphTarget* source_morph{
-            RpGeometryGetMorphTarget(source, morph_index)};
-        RpMorphTarget* target_morph{RpGeometryGetMorphTarget(clone, morph_index)};
-        const RwV3d* source_vertices{RpMorphTargetGetVertices(source_morph)};
-        RwV3d* target_vertices{RpMorphTargetGetVertices(target_morph)};
-        if (source_vertices == nullptr || target_vertices == nullptr) {
-            RpGeometryDestroy(clone);
-            return nullptr;
-        }
-        std::memcpy(target_vertices, source_vertices,
-                    sizeof(RwV3d) * static_cast<std::size_t>(vertex_count));
-        RpMorphTargetSetBoundingSphere(
-            target_morph, RpMorphTargetGetBoundingSphere(source_morph));
-
-        const RwV3d* source_normals{RpMorphTargetGetVertexNormals(source_morph)};
-        RwV3d* target_normals{RpMorphTargetGetVertexNormals(target_morph)};
-        if (source_normals != nullptr && target_normals != nullptr) {
-            std::memcpy(target_normals, source_normals,
-                        sizeof(RwV3d) * static_cast<std::size_t>(vertex_count));
-        }
-    }
-
-    const RwRGBA* source_colors{RpGeometryGetPreLightColors(source)};
-    RwRGBA* target_colors{RpGeometryGetPreLightColors(clone)};
-    if (source_colors != nullptr && target_colors != nullptr) {
-        std::memcpy(target_colors, source_colors,
-                    sizeof(RwRGBA) * static_cast<std::size_t>(vertex_count));
-    }
-    for (RwInt32 uv_index{}; uv_index < texcoord_count; ++uv_index) {
-        const auto coordinate_index{
-            static_cast<RwTextureCoordinateIndex>(uv_index)};
-        const RwTexCoords* source_uvs{
-            RpGeometryGetVertexTexCoords(source, coordinate_index)};
-        RwTexCoords* target_uvs{
-            RpGeometryGetVertexTexCoords(clone, coordinate_index)};
-        if (source_uvs == nullptr || target_uvs == nullptr) {
-            RpGeometryDestroy(clone);
-            return nullptr;
-        }
-        std::memcpy(target_uvs, source_uvs,
-                    sizeof(RwTexCoords) * static_cast<std::size_t>(vertex_count));
-    }
-
-    const RpTriangle* source_triangles{RpGeometryGetTriangles(source)};
-    RpTriangle* target_triangles{RpGeometryGetTriangles(clone)};
-    if (source_triangles == nullptr || target_triangles == nullptr) {
-        RpGeometryDestroy(clone);
-        return nullptr;
-    }
-    for (RwInt32 triangle_index{}; triangle_index < triangle_count;
-         ++triangle_index) {
-        const RpTriangle& source_triangle{source_triangles[triangle_index]};
-        RpTriangle& target_triangle{target_triangles[triangle_index]};
-        RpGeometryTriangleSetVertexIndices(
-            clone, &target_triangle, source_triangle.vertIndex[0],
-            source_triangle.vertIndex[1], source_triangle.vertIndex[2]);
-        RpMaterial* material{
-            RpGeometryTriangleGetMaterial(source, &source_triangle)};
-        if (material == nullptr ||
-            RpGeometryTriangleSetMaterial(clone, &target_triangle, material) == nullptr) {
-            RpGeometryDestroy(clone);
-            return nullptr;
-        }
-    }
-    if (RpGeometryUnlock(clone) == nullptr) {
-        RpGeometryDestroy(clone);
-        return nullptr;
-    }
-    return clone;
-}
 
 } // namespace
 
@@ -511,10 +406,9 @@ public:
         resolve_module_paths();
         load_settings();
         const bool data_loaded{load_runtime_data()};
-        install_update_hook();
         if (data_loaded) install_hand_object_hooks();
         log(data_loaded
-                ? "Handies activo: esqueleto nativo y dedos agregados en memoria."
+                ? "Handies activo: Skin nativa y perfiles morph de manos cargados."
                 : "ERROR: Handies.dat no pudo cargarse; el mod queda inactivo.");
 
         plugin::Events::initGameEvent += [this] {
@@ -541,7 +435,6 @@ public:
     }
 
 private:
-    using UpdateAnimationsFunction = void(__cdecl*)(RpClump*, float, bool);
     using ClumpRenderFunction = RpClump*(__cdecl*)(RpClump*);
 
     void resolve_module_paths() noexcept {
@@ -741,26 +634,13 @@ private:
         }
     }
 
-    void install_update_hook() noexcept {
-        const auto previous{injector::MakeCALL(
-            update_animations_call_address,
-            injector::raw_ptr(&update_animations_hook))};
-        if (const UpdateAnimationsFunction original{previous.get()}; original != nullptr) {
-            original_update_animations_ = original;
-        }
-        log(original_update_animations_ != nullptr
-                ? "Hook nativo de actualización instalado."
-                : "ERROR: no se pudo instalar el hook de actualización.");
-    }
-
     void install_final_render_hook() noexcept {
         if (final_render_hook_attempted_) return;
         final_render_hook_attempted_ = true;
 
-        // CPed::PreRender updates RpHAnim after the gameplay animation pass.
-        // Apply the private finger nodes at CEntity::Render's final
-        // RpClumpRender call so neither GTA nor Inertia3D can overwrite them
-        // before the skin pipeline consumes the matrices.
+        // Apply the hand morph after CPed::PreRender and restore its shared
+        // geometry immediately after RpClumpRender. GTA's HAnim and Skin are
+        // never replaced or expanded.
         if (injector::ReadMemory<std::uint8_t>(
                 entity_render_clump_call_address, true) != 0xE8U) {
             log("ERROR: la llamada final a RpClumpRender no es compatible.");
@@ -785,7 +665,7 @@ private:
             ? original_clump_render_(clump)
             : clump};
         if (instance_ != nullptr && entry != nullptr) {
-            instance_->restore_native_hierarchies(*entry);
+            instance_->restore_hand_profiles(*entry);
         }
         return result;
     }
@@ -862,14 +742,6 @@ private:
         }
     }
 
-    static void __cdecl update_animations_hook(
-        RpClump* clump, float time_step, bool on_screen) noexcept {
-        if (original_update_animations_ != nullptr) {
-            original_update_animations_(clump, time_step, on_screen);
-        }
-        if (instance_ != nullptr) instance_->apply_for_clump(clump);
-    }
-
     [[nodiscard]] const RuntimeProfile* find_profile(
         const RpGeometry* geometry) const noexcept {
         if (geometry == nullptr) return nullptr;
@@ -907,86 +779,12 @@ private:
         return nullptr;
     }
 
-    static void destroy_prepared(
-        std::array<PreparedAtomic, max_atomics_per_ped>& prepared) noexcept {
-        for (auto& item : prepared) {
-            if (item.geometry != nullptr) {
-                RpGeometryDestroy(item.geometry);
-                item.geometry = nullptr;
-            }
-        }
-    }
-
-    static void destroy_new_hierarchies(
-        std::array<HierarchyPlan, max_atomics_per_ped>& plans) noexcept {
-        for (auto& plan : plans) {
-            destroy_runtime_hierarchy(plan.new_hierarchy);
-            plan.new_hierarchy = nullptr;
-        }
-    }
-
-    static void destroy_runtime_hierarchy(
-        RpHAnimHierarchy* hierarchy) noexcept {
-        if (hierarchy == nullptr) return;
-        RtAnimAnimation* animation{hierarchy->currentAnim != nullptr
-            ? hierarchy->currentAnim->pCurrentAnim
-            : nullptr};
-        if (animation != nullptr) {
-            RtAnimAnimationDestroy(animation);
-            hierarchy->currentAnim->pCurrentAnim = nullptr;
-        }
-        RpHAnimHierarchyDestroy(hierarchy);
-    }
-
     static void destroy_entry(PedEntry& entry) noexcept {
-        for (std::size_t index{}; index < entry.binding_count; ++index) {
-            destroy_runtime_hierarchy(entry.bindings[index].render_hierarchy);
-        }
         entry = {};
     }
 
     void release_all() noexcept {
         for (auto& entry : entries_) destroy_entry(entry);
-    }
-
-    [[nodiscard]] static RpHAnimHierarchy* create_runtime_hierarchy(
-        RpHAnimHierarchy* old_hierarchy) noexcept {
-        if (old_hierarchy == nullptr || old_hierarchy->numNodes != native_bone_count ||
-            old_hierarchy->pNodeInfo == nullptr ||
-            old_hierarchy->pMatrixArray == nullptr) {
-            return nullptr;
-        }
-        std::array<RwUInt32, runtime_bone_count> node_flags{};
-        std::array<RwInt32, runtime_bone_count> node_ids{};
-        for (int index{}; index < native_bone_count; ++index) {
-            node_flags[index] =
-                static_cast<RwUInt32>(old_hierarchy->pNodeInfo[index].flags);
-            node_ids[index] = old_hierarchy->pNodeInfo[index].nodeID;
-        }
-        for (int offset{}; offset < finger_bones_per_hand; ++offset) {
-            node_ids[native_bone_count + offset] = left_extra_id_base + offset;
-            node_ids[native_bone_count + finger_bones_per_hand + offset] =
-                right_extra_id_base + offset;
-        }
-        const auto hierarchy_flags{static_cast<RpHAnimHierarchyFlag>(
-            rpHANIMHIERARCHYUPDATEMODELLINGMATRICES |
-            rpHANIMHIERARCHYUPDATELTMS)};
-        RpHAnimHierarchy* hierarchy{RpHAnimHierarchyCreate(
-            runtime_bone_count, node_flags.data(), node_ids.data(), hierarchy_flags,
-            static_cast<RwInt32>(sizeof(RpHAnimBlendInterpFrame)))};
-        if (hierarchy == nullptr || hierarchy->pMatrixArray == nullptr ||
-            hierarchy->pNodeInfo == nullptr) {
-            if (hierarchy != nullptr) RpHAnimHierarchyDestroy(hierarchy);
-            return nullptr;
-        }
-        // This hierarchy is a render-time matrix palette, not a participant in
-        // GTA's CAnimBlendClumpData. It deliberately owns no animation object.
-        // The parent frame is observed by the skin pipeline, but the frame's
-        // HAnim plugin remains attached to the original native hierarchy.
-        hierarchy->parentFrame = old_hierarchy->parentFrame;
-        std::memcpy(hierarchy->pMatrixArray, old_hierarchy->pMatrixArray,
-                    sizeof(RwMatrix) * native_bone_count);
-        return hierarchy;
     }
 
     void log_injection_failure(const char* message) noexcept {
@@ -996,7 +794,7 @@ private:
         log(message);
     }
 
-    [[nodiscard]] bool inject_runtime_skeleton(PedEntry& entry) {
+    [[nodiscard]] bool prepare_hand_profiles(PedEntry& entry) {
         RpClump* clump{entry.ped != nullptr ? entry.ped->m_pRwClump : nullptr};
         if (clump == nullptr) return false;
         RpHAnimHierarchy* primary_hierarchy{GetAnimHierarchyFromSkinClump(clump)};
@@ -1042,14 +840,14 @@ private:
             profiles[index] = profile;
             std::size_t binding_index{plan_count};
             for (std::size_t plan_index{}; plan_index < plan_count; ++plan_index) {
-                if (plans[plan_index].old_hierarchy == hierarchy &&
+                if (plans[plan_index].source_hierarchy == hierarchy &&
                     plans[plan_index].profile == profiles[index]) {
                     binding_index = plan_index;
                     break;
                 }
             }
             if (binding_index == plan_count) {
-                plans[plan_count] = {hierarchy, nullptr, profiles[index]};
+                plans[plan_count] = {hierarchy, profiles[index]};
                 ++plan_count;
             }
             atomic_binding_indices[index] = binding_index;
@@ -1077,76 +875,43 @@ private:
             log_injection_failure(message.data());
             return false;
         }
-        for (std::size_t index{}; index < plan_count; ++index) {
-            plans[index].new_hierarchy =
-                create_runtime_hierarchy(plans[index].old_hierarchy);
-            if (plans[index].new_hierarchy == nullptr) {
-                destroy_new_hierarchies(plans);
-                log_injection_failure(
-                    "Inyeccion omitida: no se pudo crear la paleta privada de 62 matrices.");
-                return false;
-            }
-        }
-
-        std::array<PreparedAtomic, max_atomics_per_ped> prepared{};
-        for (std::size_t index{}; index < atomics.size; ++index) {
-            RpGeometry* clone{clone_geometry(RpAtomicGetGeometry(atomics.values[index]))};
-            if (clone == nullptr) {
-                destroy_prepared(prepared);
-                destroy_new_hierarchies(plans);
-                log_injection_failure(
-                    "Inyeccion omitida: no se pudo clonar la geometria del ped.");
-                return false;
-            }
-            RuntimeProfile* profile{const_cast<RuntimeProfile*>(profiles[index])};
-            RpSkin* runtime_skin{RpSkinCreate(
-                profile->vertex_count, runtime_bone_count, profile->weights.data(),
-                profile->indices.data(), profile->inverse_matrices.data())};
-            if (runtime_skin == nullptr) {
-                RpGeometryDestroy(clone);
-                destroy_prepared(prepared);
-                destroy_new_hierarchies(plans);
-                log_injection_failure(
-                    "Inyeccion omitida: RpSkinCreate rechazo los pesos de 62 huesos.");
-                return false;
-            }
-            RpSkinGeometrySetSkin(clone, runtime_skin);
-            prepared[index] = {
-                atomics.values[index], clone, atomic_binding_indices[index]};
-        }
-
-        for (std::size_t index{}; index < atomics.size; ++index) {
-            RpAtomicSetGeometry(prepared[index].atomic, prepared[index].geometry, 0);
-            // Outside the actual draw call GTA must continue seeing its native
-            // 32-node hierarchy. The private 62-node hierarchy is swapped in
-            // only around RpClumpRender.
-            RpSkinAtomicSetHAnimHierarchy(
-                prepared[index].atomic,
-                plans[prepared[index].binding_index].old_hierarchy);
-            RpGeometryDestroy(prepared[index].geometry);
-            prepared[index].geometry = nullptr;
-        }
         entry.clump = clump;
         entry.binding_count = plan_count;
         for (std::size_t index{}; index < plan_count; ++index) {
-            entry.bindings[index] = {
-                plans[index].old_hierarchy,
-                plans[index].new_hierarchy,
-                plans[index].profile};
-            plans[index].new_hierarchy = nullptr;
+            entry.bindings[index].source_hierarchy =
+                plans[index].source_hierarchy;
+            entry.bindings[index].profile = plans[index].profile;
         }
         entry.atomic_count = atomics.size;
         for (std::size_t index{}; index < atomics.size; ++index) {
-            entry.atomics[index] = {
-                atomics.values[index], atomic_binding_indices[index]};
+            RpGeometry* const geometry{
+                RpAtomicGetGeometry(atomics.values[index])};
+            const RpMorphTarget* const morph{
+                RpGeometryGetMorphTarget(geometry, 0)};
+            const RwV3d* const vertices{RpMorphTargetGetVertices(morph)};
+            const RwV3d* const normals{RpMorphTargetGetVertexNormals(morph)};
+            if (vertices == nullptr) {
+                destroy_entry(entry);
+                log_injection_failure(
+                    "Inyeccion omitida: geometria sin vertices base para el perfil.");
+                return false;
+            }
+            const std::size_t vertex_count{profiles[index]->vertex_count};
+            entry.atomics[index].atomic = atomics.values[index];
+            entry.atomics[index].binding_index = atomic_binding_indices[index];
+            entry.atomics[index].base_vertices.assign(
+                vertices, vertices + vertex_count);
+            if (normals != nullptr) {
+                entry.atomics[index].base_normals.assign(
+                    normals, normals + vertex_count);
+            }
         }
-        log("Ped preparado: jerarquia nativa 32 intacta y 30 dedos privados listos.");
+        log("Ped preparado: Skin nativa 32 y perfiles morph de manos activos.");
         return true;
     }
 
     void on_ped_render(CPed* ped) noexcept {
-        PedEntry* const entry{prepare_entry_for_ped(ped)};
-        if (entry != nullptr) apply_finger_matrices(*entry);
+        static_cast<void>(prepare_entry_for_ped(ped));
     }
 
     [[nodiscard]] bool is_enabled_for(const CPed* ped) const noexcept {
@@ -1165,7 +930,7 @@ private:
         if (entry == nullptr) return nullptr;
         if (entry->clump == nullptr) {
             try {
-                if (!inject_runtime_skeleton(*entry)) {
+                if (!prepare_hand_profiles(*entry)) {
                     destroy_entry(*entry);
                     return nullptr;
                 }
@@ -1215,12 +980,6 @@ private:
         entry.grip += std::clamp(target_grip - entry.grip, -grip_step, grip_step);
     }
 
-    void apply_for_clump(RpClump* clump) noexcept {
-        if (PedEntry* entry{find_entry_by_clump(clump)}; entry != nullptr) {
-            apply_finger_matrices(*entry);
-        }
-    }
-
     [[nodiscard]] PedEntry* prepare_for_clump_render(RpClump* clump) noexcept {
         PedEntry* entry{find_entry_by_clump(clump)};
         if (entry == nullptr) {
@@ -1229,61 +988,44 @@ private:
             update_finger_state(*entry);
         }
         apply_finger_matrices(*entry);
-        for (std::size_t index{}; index < entry->atomic_count; ++index) {
-            const RuntimeAtomic& item{entry->atomics[index]};
-            if (item.atomic == nullptr || item.binding_index >= entry->binding_count) {
-                continue;
-            }
-            RpSkinAtomicSetHAnimHierarchy(
-                item.atomic,
-                entry->bindings[item.binding_index].render_hierarchy);
-        }
         return entry;
     }
 
-    static void restore_native_hierarchies(PedEntry& entry) noexcept {
-        for (std::size_t index{}; index < entry.atomic_count; ++index) {
-            const RuntimeAtomic& item{entry.atomics[index]};
-            if (item.atomic == nullptr || item.binding_index >= entry.binding_count) {
-                continue;
-            }
-            RpSkinAtomicSetHAnimHierarchy(
-                item.atomic,
-                entry.bindings[item.binding_index].source_hierarchy);
-        }
-    }
-
-    void apply_finger_matrices(PedEntry& entry) const noexcept {
+    void apply_finger_matrices(PedEntry& entry) noexcept {
         const HandSignalState signal{entry.ped != nullptr
             ? read_hand_signal_state(*entry.ped)
             : HandSignalState{}};
         for (std::size_t binding_index{};
              binding_index < entry.binding_count;
             ++binding_index) {
-            const RuntimeBinding& binding{entry.bindings[binding_index]};
+            RuntimeBinding& binding{entry.bindings[binding_index]};
             if (binding.source_hierarchy == nullptr ||
-                binding.render_hierarchy == nullptr || binding.profile == nullptr ||
+                binding.profile == nullptr ||
                 binding.source_hierarchy->numNodes != native_bone_count ||
-                binding.source_hierarchy->pMatrixArray == nullptr ||
-                binding.render_hierarchy->numNodes != runtime_bone_count ||
-                binding.render_hierarchy->pMatrixArray == nullptr) {
+                binding.source_hierarchy->pNodeInfo == nullptr) {
                 continue;
             }
-            RwMatrix* matrices{binding.render_hierarchy->pMatrixArray};
-            std::memcpy(
-                matrices, binding.source_hierarchy->pMatrixArray,
-                sizeof(RwMatrix) * native_bone_count);
+            RwMatrix* const matrices{binding.pose_matrices.data()};
+            for (int index{}; index < native_bone_count; ++index) {
+                RwMatrixInvert(
+                    &matrices[index],
+                    &binding.profile->inverse_matrices[
+                        static_cast<std::size_t>(index)]);
+            }
             for (int side{}; side < 2; ++side) {
+                const int hand_index{RpHAnimIDGetIndex(
+                    binding.source_hierarchy,
+                    side == 0 ? left_hand_id : right_hand_id)};
+                if (hand_index < 0 || hand_index >= native_bone_count) continue;
                 for (int source_id{3}; source_id <= 17; ++source_id) {
-                    const int target_id{target_bone_id(side, source_id)};
                     const int target_index{
-                        RpHAnimIDGetIndex(binding.render_hierarchy, target_id)};
+                        native_bone_count + side * finger_bones_per_hand +
+                        source_id - 3};
                     const int parent_source{parent_source_id(source_id)};
-                    const int parent_id{parent_source == 2
-                        ? (side == 0 ? left_hand_id : right_hand_id)
-                        : target_bone_id(side, parent_source)};
-                    const int parent_index{
-                        RpHAnimIDGetIndex(binding.render_hierarchy, parent_id)};
+                    const int parent_index{parent_source == 2
+                        ? hand_index
+                        : native_bone_count + side * finger_bones_per_hand +
+                            parent_source - 3};
                     if (target_index < 0 || target_index >= runtime_bone_count ||
                         parent_index < 0 || parent_index >= runtime_bone_count) {
                         break;
@@ -1321,6 +1063,143 @@ private:
                 }
             }
         }
+        deform_hand_profiles(entry);
+    }
+
+    void deform_hand_profiles(PedEntry& entry) noexcept {
+        constexpr float minimum_weight{1.0e-6F};
+        for (std::size_t atomic_index{}; atomic_index < entry.atomic_count;
+             ++atomic_index) {
+            RuntimeAtomic& item{entry.atomics[atomic_index]};
+            if (item.atomic == nullptr || item.binding_index >= entry.binding_count) {
+                continue;
+            }
+            RuntimeBinding& binding{entry.bindings[item.binding_index]};
+            const RuntimeProfile* const profile{binding.profile};
+            RpGeometry* const geometry{RpAtomicGetGeometry(item.atomic)};
+            if (profile == nullptr || geometry == nullptr ||
+                item.base_vertices.size() != profile->vertex_count ||
+                profile->weights.size() != profile->vertex_count ||
+                profile->indices.size() != profile->vertex_count) {
+                continue;
+            }
+            std::array<RwMatrix, runtime_bone_count> skin_matrices{};
+            for (int bone{}; bone < runtime_bone_count; ++bone) {
+                RwMatrixMultiply(
+                    &skin_matrices[static_cast<std::size_t>(bone)],
+                    &profile->inverse_matrices[static_cast<std::size_t>(bone)],
+                    &binding.pose_matrices[static_cast<std::size_t>(bone)]);
+            }
+            const bool has_normals{
+                item.base_normals.size() == item.base_vertices.size()};
+            const RwInt32 lock_flags{rpGEOMETRYLOCKVERTICES |
+                (has_normals ? rpGEOMETRYLOCKNORMALS : 0)};
+            if (RpGeometryLock(geometry, lock_flags) == nullptr) continue;
+            RpMorphTarget* const morph{RpGeometryGetMorphTarget(geometry, 0)};
+            RwV3d* const vertices{RpMorphTargetGetVertices(morph)};
+            RwV3d* const normals{has_normals
+                ? RpMorphTargetGetVertexNormals(morph)
+                : nullptr};
+            if (vertices == nullptr || (has_normals && normals == nullptr)) {
+                RpGeometryUnlock(geometry);
+                continue;
+            }
+            for (std::size_t vertex{}; vertex < item.base_vertices.size(); ++vertex) {
+                const RwUInt32 packed{profile->indices[vertex]};
+                const std::array<RwUInt32, 4> bone_indices{
+                    packed & 0xFFU,
+                    (packed >> 8U) & 0xFFU,
+                    (packed >> 16U) & 0xFFU,
+                    (packed >> 24U) & 0xFFU};
+                const RwMatrixWeights& packed_weights{profile->weights[vertex]};
+                const std::array<float, 4> weights{
+                    packed_weights.w0, packed_weights.w1,
+                    packed_weights.w2, packed_weights.w3};
+                bool belongs_to_finger_profile{};
+                for (std::size_t slot{}; slot < weights.size(); ++slot) {
+                    if (weights[slot] > minimum_weight &&
+                        bone_indices[slot] >= native_bone_count) {
+                        belongs_to_finger_profile = true;
+                        break;
+                    }
+                }
+                if (!belongs_to_finger_profile) continue;
+
+                RwV3d morphed{};
+                RwV3d morphed_normal{};
+                for (std::size_t slot{}; slot < weights.size(); ++slot) {
+                    const float weight{weights[slot]};
+                    const RwUInt32 bone{bone_indices[slot]};
+                    if (weight <= minimum_weight || bone >= runtime_bone_count) {
+                        continue;
+                    }
+                    RwV3d transformed{};
+                    RwV3dTransformPoint(
+                        &transformed, &item.base_vertices[vertex],
+                        &skin_matrices[bone]);
+                    morphed.x += transformed.x * weight;
+                    morphed.y += transformed.y * weight;
+                    morphed.z += transformed.z * weight;
+                    if (has_normals) {
+                        RwV3d transformed_normal{};
+                        RwV3dTransformVector(
+                            &transformed_normal, &item.base_normals[vertex],
+                            &skin_matrices[bone]);
+                        morphed_normal.x += transformed_normal.x * weight;
+                        morphed_normal.y += transformed_normal.y * weight;
+                        morphed_normal.z += transformed_normal.z * weight;
+                    }
+                }
+                vertices[vertex] = morphed;
+                if (has_normals) {
+                    const float length_squared{
+                        morphed_normal.x * morphed_normal.x +
+                        morphed_normal.y * morphed_normal.y +
+                        morphed_normal.z * morphed_normal.z};
+                    if (length_squared > 1.0e-12F) {
+                        const float inverse_length{
+                            1.0F / std::sqrt(length_squared)};
+                        morphed_normal.x *= inverse_length;
+                        morphed_normal.y *= inverse_length;
+                        morphed_normal.z *= inverse_length;
+                    }
+                    normals[vertex] = morphed_normal;
+                }
+            }
+            RpGeometryUnlock(geometry);
+        }
+    }
+
+    static void restore_hand_profiles(PedEntry& entry) noexcept {
+        for (std::size_t atomic_index{}; atomic_index < entry.atomic_count;
+             ++atomic_index) {
+            RuntimeAtomic& item{entry.atomics[atomic_index]};
+            RpGeometry* const geometry{item.atomic != nullptr
+                ? RpAtomicGetGeometry(item.atomic)
+                : nullptr};
+            if (geometry == nullptr || item.base_vertices.empty()) continue;
+            const bool has_normals{
+                item.base_normals.size() == item.base_vertices.size()};
+            const RwInt32 lock_flags{rpGEOMETRYLOCKVERTICES |
+                (has_normals ? rpGEOMETRYLOCKNORMALS : 0)};
+            if (RpGeometryLock(geometry, lock_flags) == nullptr) continue;
+            RpMorphTarget* const morph{RpGeometryGetMorphTarget(geometry, 0)};
+            RwV3d* const vertices{RpMorphTargetGetVertices(morph)};
+            RwV3d* const normals{has_normals
+                ? RpMorphTargetGetVertexNormals(morph)
+                : nullptr};
+            if (vertices != nullptr) {
+                std::memcpy(
+                    vertices, item.base_vertices.data(),
+                    sizeof(RwV3d) * item.base_vertices.size());
+            }
+            if (normals != nullptr) {
+                std::memcpy(
+                    normals, item.base_normals.data(),
+                    sizeof(RwV3d) * item.base_normals.size());
+            }
+            RpGeometryUnlock(geometry);
+        }
     }
 
     void remove_for_ped(const CPed* ped) noexcept {
@@ -1344,8 +1223,6 @@ private:
     std::array<char, MAX_PATH> data_path_{};
 
     inline static HandiesMod* instance_{};
-    inline static UpdateAnimationsFunction original_update_animations_{
-        reinterpret_cast<UpdateAnimationsFunction>(0x4D34F0)};
     inline static ClumpRenderFunction original_clump_render_{};
     inline static std::uintptr_t original_hand_pre_render_{0x59ECD0};
     inline static std::uintptr_t original_hand_render_{0x59EE80};

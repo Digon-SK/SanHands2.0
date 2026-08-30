@@ -2,7 +2,7 @@
 
 SanHands 2.0 adds articulated, animated fingers to GTA San Andreas pedestrians while preserving the game's native ped animation system.
 
-The generated DFFs contain the replacement hand geometry, closed wrist seams, corrected UV islands, and **only the original 32-bone GTA ped skeleton**. The 30 additional finger bones are not stored in any ped model: `Handies.asi` creates them for each ped at runtime.
+The generated DFFs contain the replacement hand geometry, closed wrist seams, corrected UV islands, and **only the original 32-bone GTA ped skeleton**. Finger bones are used only while building per-hand morph profiles; `Handies.asi` never inserts them into GTA's HAnim hierarchy.
 
 ## Design
 
@@ -11,11 +11,10 @@ The generated DFFs contain the replacement hand geometry, closed wrist seams, co
 - Preserves the detailed hand UV topology and maps it into the ped's dominant skin region.
 - Restores the original 32-node HAnim hierarchy and 32-bone Skin PLG before writing each final DFF.
 - Keeps GTA's normal walk, fight, weapon, gesture, and body animation associations at 32 frames.
-- Creates a private geometry and a 62-node render hierarchy only after GTA has initialized a ped normally.
-- Appends the complete 15-node gang-hand hierarchy to each native `hand` node without reusing or changing GTA's `finger` and `finger01` nodes.
-- Evaluates relaxed, grip/fist, `FUCKU`, and the ten original gang-sign finger tracks after the native animation update.
-- Temporarily swaps each atomic to the private hierarchy only during the final `RpClumpRender` call, then immediately restores its native hierarchy.
-- Leaves the native 32-frame hierarchy, `CAnimBlendClumpData`, animations, and ownership untouched, following the separate-hierarchy behavior used by GTA's `CHandObject` system.
+- Builds a geometry-specific hand profile containing its finger vertex mask, gang-hand weights, bind matrices, offsets, and base normals.
+- Evaluates `relaxed`, `grip/fist`, `FUCKU`, and the ten original gang-sign tracks from the installed `ghands.ifp` as morph shapes.
+- Applies the selected morph to the shared hand vertices immediately before `RpClumpRender`, renders through the untouched native 32-bone Skin, and restores the base vertices immediately afterward.
+- Never creates a 62-node runtime hierarchy, swaps HAnim owners, or changes `CAnimBlendClumpData`, `finger`, or `finger01`.
 - Uses the active native hand-signal task's animation ID and playback time, while suppressing only its separate replacement-hand render pass.
 - Copies TXD files byte-for-byte.
 
@@ -25,8 +24,8 @@ The generated DFFs contain the replacement hand geometry, closed wrist seams, co
 
 The installed mod consists of:
 
-- `Handies.asi`: runtime hierarchy injection and finger animation.
-- `Handies.dat`: geometry-specific skin weights, inverse bind matrices, finger offsets, and sampled hand poses.
+- `Handies.asi`: render-time hand-profile blending and finger animation.
+- `Handies.dat`: geometry-specific morph masks, source gang-hand weights, inverse bind matrices, finger offsets, and sampled hand poses.
 - `Handies.ini`: enable/player/NPC and transition-speed settings.
 - Final DFF/TXD files: hand geometry with the native skeleton only.
 
