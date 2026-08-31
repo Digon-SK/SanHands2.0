@@ -21,6 +21,7 @@
 #include "CTask.h"
 #include "CTaskManager.h"
 #include "CTimer.h"
+#include "CVehicle.h"
 #include "CWeapon.h"
 #include "RpHAnimBlendInterpFrame.h"
 #include "common.h"
@@ -303,7 +304,13 @@ private:
     return clamped * clamped * (3.0F - 2.0F * clamped);
 }
 
+[[nodiscard]] bool is_vehicle_driver(const CPed& ped) noexcept {
+    return ped.bInVehicle && ped.m_pVehicle != nullptr &&
+           ped.m_pVehicle->m_pDriver == &ped;
+}
+
 [[nodiscard]] bool wants_closed_fist(CPed& ped) noexcept {
+    if (is_vehicle_driver(ped)) return true;
     if (ped.m_pIntelligence != nullptr) {
         auto& tasks{ped.m_pIntelligence->m_TaskMgr};
         if (tasks.FindActiveTaskByType(TASK_SIMPLE_FIGHT) != nullptr ||
@@ -1393,10 +1400,13 @@ private:
     }
 
     void apply_blendshapes(PedEntry& entry) noexcept {
-        const ActiveHandSequence configured_sequence{entry.ped != nullptr
+        const bool driver{entry.ped != nullptr &&
+            is_vehicle_driver(*entry.ped)};
+        const bool hand_gestures_allowed{entry.ped != nullptr && !driver};
+        const ActiveHandSequence configured_sequence{hand_gestures_allowed
             ? find_active_hand_sequence(*entry.ped)
             : ActiveHandSequence{}};
-        const HandSignalState signal{entry.ped != nullptr
+        const HandSignalState signal{hand_gestures_allowed
             ? read_hand_signal_state(*entry.ped)
             : HandSignalState{}};
         if (configured_sequence.profile != nullptr &&
@@ -1507,7 +1517,7 @@ private:
                 }
 
                 const float grip_blend{std::clamp(entry.grip, 0.0F, 1.0F)};
-                const float fucku_blend{side == 1
+                const float fucku_blend{side == 1 && !driver
                     ? smoothstep(entry.fucku_blend)
                     : 0.0F};
                 for (std::uint32_t local_index{}; local_index < hand.count;

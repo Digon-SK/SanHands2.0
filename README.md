@@ -33,6 +33,8 @@ The installed mod consists of:
 
 The source IFP remains `modloader\hands\ghands.ifp`; Handies does not register a second animation block in GTA. During the build, each complete finger animation whose name matches a GLB shape is compiled into `Handies.dat`. Changing only profile mappings does not require rebuilding; editing the GLB or IFP does.
 
+With no active hand action, the player is rendered from the GLB `Basis` without an additional morph. A ped occupying its vehicle's driver seat uses `Grip` on both hands; driver state takes priority over configurable hand-signal profiles until the ped leaves that seat.
+
 ## Hand sequence profiles
 
 Each `[HandProfile.Name]` section chooses one IFP sequence per side:
