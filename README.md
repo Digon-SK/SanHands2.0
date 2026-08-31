@@ -37,6 +37,8 @@ With no active hand action, the player is rendered from the GLB `Basis` without 
 
 Outside the driver seat, an equipped weapon applies the edited GLB `Weap` target to the right hand as the final hand pose. The target is used only by hand templates that actually provide it; the current edited GLB defines it on `Slim_Right`.
 
+The weapon object remains attached to GTA's native right-hand bone. Around the three native weapon-render passes, Handies temporarily applies the local `[WeaponGrip]` position/rotation correction to that bone, lets GTA copy it to the weapon frame, and restores both matrices immediately afterward. `[WeaponGrip.<eWeaponType ID>]` sections can override the default for individual weapons without changing their DFF, collision, or ped animation.
+
 ## Hand sequence profiles
 
 Each `[HandProfile.Name]` section chooses one IFP sequence per side:

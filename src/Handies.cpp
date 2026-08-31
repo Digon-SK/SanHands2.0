@@ -22,6 +22,7 @@
 #include "CTaskManager.h"
 #include "CTimer.h"
 #include "CVehicle.h"
+#include "CVisibilityPlugins.h"
 #include "CWeapon.h"
 #include "RpHAnimBlendInterpFrame.h"
 #include "common.h"
@@ -56,8 +57,12 @@ constexpr std::uintptr_t entity_render_clump_call_address{0x53439C};
 constexpr std::size_t max_tracked_peds{256};
 constexpr std::size_t max_atomics_per_ped{16};
 constexpr int native_bone_count{32};
+constexpr int native_right_hand_id{24};
 constexpr int native_hand_signal_count{5};
 constexpr int maximum_animation_groups{139};
+constexpr std::size_t weapon_type_capacity{64};
+constexpr std::array<std::uintptr_t, 3> weapon_render_call_addresses{
+    0x53EAC4, 0x705322, 0x7271E3};
 constexpr char data_file_name[]{"Handies.dat"};
 constexpr char ini_file_name[]{"Handies.ini"};
 constexpr char log_file_name[]{"Handies.log"};
@@ -77,6 +82,12 @@ struct Settings {
     bool enable_npcs{true};
     float grip_transition_speed{0.12F};
     float fucku_transition_speed{0.08F};
+};
+
+struct WeaponAdjustment {
+    bool enabled{true};
+    RwV3d position{-0.036242F, 0.002248F, 0.007982F};
+    RwV3d rotation{};
 };
 
 struct MorphTarget {
@@ -113,6 +124,13 @@ struct RuntimeProfile {
     std::uint64_t geometry_hash{};
     std::uint32_t vertex_count{};
     std::array<RuntimeHand, 2> hands{};
+};
+
+struct SavedWeaponRenderState {
+    RwMatrix* hand_matrix{};
+    RwMatrix hand_value{};
+    RwFrame* weapon_frame{};
+    RwMatrix weapon_value{};
 };
 
 struct HandSequenceProfile {
@@ -286,6 +304,21 @@ private:
         : fallback;
 }
 
+[[nodiscard]] bool parse_vector3(
+    const std::string& text,
+    RwV3d& result) noexcept {
+    RwV3d parsed{};
+    if (std::sscanf(
+            text.c_str(), " %f , %f , %f ",
+            &parsed.x, &parsed.y, &parsed.z) != 3 ||
+        !std::isfinite(parsed.x) || !std::isfinite(parsed.y) ||
+        !std::isfinite(parsed.z)) {
+        return false;
+    }
+    result = parsed;
+    return true;
+}
+
 [[nodiscard]] int parse_int(
     const std::string& value,
     int fallback) noexcept {
@@ -309,10 +342,20 @@ private:
            ped.m_pVehicle->m_pDriver == &ped;
 }
 
-[[nodiscard]] bool has_equipped_weapon(CPed& ped) noexcept {
+[[nodiscard]] bool has_equipped_hand_weapon(CPed& ped) noexcept {
     const CWeapon* const weapon{ped.GetWeapon()};
-    return weapon != nullptr &&
-           weapon->m_eWeaponType != WEAPONTYPE_UNARMED;
+    if (weapon == nullptr) return false;
+    switch (weapon->m_eWeaponType) {
+    case WEAPONTYPE_UNARMED:
+    case WEAPONTYPE_NIGHTVISION:
+    case WEAPONTYPE_INFRARED:
+    case WEAPONTYPE_PARACHUTE:
+    case WEAPONTYPE_UNUSED:
+    case WEAPONTYPE_ARMOUR:
+        return false;
+    default:
+        return true;
+    }
 }
 
 [[nodiscard]] bool wants_closed_fist(CPed& ped) noexcept {
@@ -481,6 +524,7 @@ public:
             weapon_profile_logged_ = false;
             load_settings();
             install_final_render_hook();
+            install_weapon_render_hooks();
             if (profiles_.empty() && !load_runtime_data()) {
                 log("ERROR: Handies.dat sigue sin estar disponible al iniciar partida.");
             } else {
@@ -503,6 +547,7 @@ public:
 
 private:
     using ClumpRenderFunction = RpClump*(__cdecl*)(RpClump*);
+    using WeaponRenderFunction = void(__cdecl*)();
 
     void resolve_module_paths() noexcept {
         std::array<char, MAX_PATH> temp_path{};
@@ -549,6 +594,53 @@ private:
         settings_.fucku_transition_speed = std::clamp(
             read_float(ini_path_.data(), "FuckUTransitionSpeed", 0.08F),
             0.01F, 1.0F);
+
+        WeaponAdjustment default_adjustment{};
+        default_adjustment.enabled = parse_int(read_ini_string(
+            ini_path_.data(), "WeaponGrip", "Enabled", "1"), 1) != 0;
+        static_cast<void>(parse_vector3(read_ini_string(
+            ini_path_.data(), "WeaponGrip", "Position",
+            "-0.036242,0.002248,0.007982"), default_adjustment.position));
+        static_cast<void>(parse_vector3(read_ini_string(
+            ini_path_.data(), "WeaponGrip", "Rotation", "0,0,0"),
+            default_adjustment.rotation));
+        const auto clamp_adjustment = [](WeaponAdjustment& adjustment) noexcept {
+            adjustment.position.x = std::clamp(adjustment.position.x, -1.0F, 1.0F);
+            adjustment.position.y = std::clamp(adjustment.position.y, -1.0F, 1.0F);
+            adjustment.position.z = std::clamp(adjustment.position.z, -1.0F, 1.0F);
+            adjustment.rotation.x = std::clamp(
+                adjustment.rotation.x, -180.0F, 180.0F);
+            adjustment.rotation.y = std::clamp(
+                adjustment.rotation.y, -180.0F, 180.0F);
+            adjustment.rotation.z = std::clamp(
+                adjustment.rotation.z, -180.0F, 180.0F);
+        };
+        clamp_adjustment(default_adjustment);
+        weapon_adjustments_.fill(default_adjustment);
+        for (std::size_t type{}; type < weapon_adjustments_.size(); ++type) {
+            std::array<char, 32> section{};
+            std::snprintf(
+                section.data(), section.size(), "WeaponGrip.%u",
+                static_cast<unsigned>(type));
+            WeaponAdjustment adjustment{default_adjustment};
+            const std::string enabled{read_ini_string(
+                ini_path_.data(), section.data(), "Enabled")};
+            if (!enabled.empty()) {
+                adjustment.enabled = parse_int(enabled, adjustment.enabled ? 1 : 0) != 0;
+            }
+            const std::string position{read_ini_string(
+                ini_path_.data(), section.data(), "Position")};
+            if (!position.empty()) {
+                static_cast<void>(parse_vector3(position, adjustment.position));
+            }
+            const std::string rotation{read_ini_string(
+                ini_path_.data(), section.data(), "Rotation")};
+            if (!rotation.empty()) {
+                static_cast<void>(parse_vector3(rotation, adjustment.rotation));
+            }
+            clamp_adjustment(adjustment);
+            weapon_adjustments_[type] = adjustment;
+        }
     }
 
     [[nodiscard]] int find_hand_animation_index(
@@ -974,6 +1066,148 @@ private:
         return result;
     }
 
+    [[nodiscard]] bool ped_uses_weapon_pose(CPed& ped) noexcept {
+        const PedEntry* const entry{find_entry_by_ped(&ped)};
+        if (entry == nullptr) return false;
+        for (std::size_t index{}; index < entry->atomic_count; ++index) {
+            const RuntimeProfile* const profile{entry->atomics[index].profile};
+            if (profile == nullptr) continue;
+            const RuntimeHand& right_hand{profile->hands[1]};
+            if (right_hand.template_index >= morph_templates_.size()) continue;
+            if (find_morph_target(
+                    morph_templates_[right_hand.template_index], "Weap") != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [[nodiscard]] std::size_t prepare_weapon_render_states(
+        std::array<SavedWeaponRenderState, max_tracked_peds>& saved) noexcept {
+        std::size_t saved_count{};
+        auto& list{CVisibilityPlugins::ms_weaponPedsForPC};
+        for (CLink<CPed*>* link{list.usedListTail.prev};
+             link != nullptr && link != &list.usedListHead;
+             link = link->prev) {
+            CPed* const ped{link->data};
+            if (ped == nullptr || ped->m_pRwClump == nullptr ||
+                ped->m_pWeaponObject == nullptr || is_vehicle_driver(*ped) ||
+                !has_equipped_hand_weapon(*ped) || !ped_uses_weapon_pose(*ped) ||
+                saved_count >= saved.size()) {
+                continue;
+            }
+            const CWeapon* const weapon{ped->GetWeapon()};
+            const std::size_t weapon_type{weapon != nullptr
+                ? static_cast<std::size_t>(weapon->m_eWeaponType)
+                : weapon_adjustments_.size()};
+            if (weapon_type >= weapon_adjustments_.size()) continue;
+            const WeaponAdjustment& adjustment{weapon_adjustments_[weapon_type]};
+            if (!adjustment.enabled) continue;
+
+            RpHAnimHierarchy* const hierarchy{
+                GetAnimHierarchyFromSkinClump(ped->m_pRwClump)};
+            if (hierarchy == nullptr || hierarchy->numNodes != native_bone_count) {
+                continue;
+            }
+            const int hand_index{
+                RpHAnimIDGetIndex(hierarchy, native_right_hand_id)};
+            if (hand_index < 0 || hand_index >= hierarchy->numNodes) continue;
+            RwMatrix* const hand_matrix{
+                &RpHAnimHierarchyGetMatrixArray(hierarchy)[hand_index]};
+            RpClump* const weapon_clump{
+                reinterpret_cast<RpClump*>(ped->m_pWeaponObject)};
+            RwFrame* const weapon_frame{RpClumpGetFrame(weapon_clump)};
+            if (hand_matrix == nullptr || weapon_frame == nullptr) continue;
+
+            SavedWeaponRenderState& state{saved[saved_count++]};
+            state.hand_matrix = hand_matrix;
+            state.hand_value = *hand_matrix;
+            state.weapon_frame = weapon_frame;
+            state.weapon_value = *RwFrameGetMatrix(weapon_frame);
+
+            constexpr RwV3d x_axis{1.0F, 0.0F, 0.0F};
+            constexpr RwV3d y_axis{0.0F, 1.0F, 0.0F};
+            constexpr RwV3d z_axis{0.0F, 0.0F, 1.0F};
+            RwMatrixRotate(
+                hand_matrix, &x_axis, adjustment.rotation.x,
+                rwCOMBINEPRECONCAT);
+            RwMatrixRotate(
+                hand_matrix, &y_axis, adjustment.rotation.y,
+                rwCOMBINEPRECONCAT);
+            RwMatrixRotate(
+                hand_matrix, &z_axis, adjustment.rotation.z,
+                rwCOMBINEPRECONCAT);
+            RwMatrixTranslate(
+                hand_matrix, &adjustment.position, rwCOMBINEPRECONCAT);
+        }
+        return saved_count;
+    }
+
+    static void restore_weapon_render_states(
+        std::array<SavedWeaponRenderState, max_tracked_peds>& saved,
+        std::size_t count) noexcept {
+        while (count > 0) {
+            SavedWeaponRenderState& state{saved[--count]};
+            if (state.hand_matrix != nullptr) {
+                *state.hand_matrix = state.hand_value;
+            }
+            if (state.weapon_frame != nullptr) {
+                *RwFrameGetMatrix(state.weapon_frame) = state.weapon_value;
+                RwFrameUpdateObjects(state.weapon_frame);
+            }
+        }
+    }
+
+    static void render_weapons_with_adjustment(std::size_t slot) noexcept {
+        std::array<SavedWeaponRenderState, max_tracked_peds> saved{};
+        const std::size_t count{instance_ != nullptr
+            ? instance_->prepare_weapon_render_states(saved)
+            : 0U};
+        if (slot < original_weapon_render_.size() &&
+            original_weapon_render_[slot] != nullptr) {
+            original_weapon_render_[slot]();
+        }
+        restore_weapon_render_states(saved, count);
+    }
+
+    static void __cdecl weapon_render_hook_0() noexcept {
+        render_weapons_with_adjustment(0);
+    }
+
+    static void __cdecl weapon_render_hook_1() noexcept {
+        render_weapons_with_adjustment(1);
+    }
+
+    static void __cdecl weapon_render_hook_2() noexcept {
+        render_weapons_with_adjustment(2);
+    }
+
+    void install_weapon_render_hooks() noexcept {
+        if (weapon_render_hooks_attempted_) return;
+        weapon_render_hooks_attempted_ = true;
+        for (const std::uintptr_t address : weapon_render_call_addresses) {
+            if (injector::ReadMemory<std::uint8_t>(address, true) != 0xE8U) {
+                log("ERROR: una llamada de render de armas no es compatible.");
+                return;
+            }
+        }
+        constexpr std::array<WeaponRenderFunction, 3> hooks{
+            &weapon_render_hook_0, &weapon_render_hook_1, &weapon_render_hook_2};
+        for (std::size_t index{}; index < weapon_render_call_addresses.size();
+             ++index) {
+            const auto previous{injector::MakeCALL(
+                weapon_render_call_addresses[index],
+                injector::raw_ptr(hooks[index]))};
+            original_weapon_render_[index] = previous.get();
+            if (original_weapon_render_[index] == nullptr) {
+                log("ERROR: no se pudo enlazar el ajuste de armas.");
+                return;
+            }
+        }
+        weapon_render_hooks_installed_ = true;
+        log("Ajuste local de armas enlazado al render de BONE_R_HAND.");
+    }
+
     void install_hand_object_hooks() noexcept {
         if (hand_object_hooks_installed_) return;
 
@@ -1306,6 +1540,7 @@ private:
         // Handies is loaded before some graphics ASIs. Installing on the first
         // gameplay tick preserves and chains the final target chosen by them.
         install_final_render_hook();
+        install_weapon_render_hooks();
         constexpr unsigned int retry_interval_ms{1000U};
         constexpr unsigned int maximum_retries{10U};
         const unsigned int now{CTimer::m_snTimeInMilliseconds};
@@ -1410,7 +1645,7 @@ private:
         const bool driver{entry.ped != nullptr &&
             is_vehicle_driver(*entry.ped)};
         const bool right_hand_holds_weapon{entry.ped != nullptr && !driver &&
-            has_equipped_weapon(*entry.ped)};
+            has_equipped_hand_weapon(*entry.ped)};
         const bool hand_gestures_allowed{entry.ped != nullptr && !driver};
         const ActiveHandSequence configured_sequence{hand_gestures_allowed
             ? find_active_hand_sequence(*entry.ped)
@@ -1630,6 +1865,7 @@ private:
     std::vector<HandSequenceProfile> sequence_profiles_{};
     std::vector<PedAnimationMapping> animation_mappings_{};
     std::vector<RuntimeProfile> profiles_{};
+    std::array<WeaponAdjustment, weapon_type_capacity> weapon_adjustments_{};
     std::array<PedEntry, max_tracked_peds> entries_{};
     std::array<char, MAX_PATH> ini_path_{};
     std::array<char, MAX_PATH> log_path_{};
@@ -1638,11 +1874,14 @@ private:
 
     inline static HandiesMod* instance_{};
     inline static ClumpRenderFunction original_clump_render_{};
+    inline static std::array<WeaponRenderFunction, 3> original_weapon_render_{};
     inline static std::uintptr_t original_hand_pre_render_{0x59ECD0};
     inline static std::uintptr_t original_hand_render_{0x59EE80};
     bool hand_object_hooks_installed_{};
     bool final_render_hook_attempted_{};
     bool final_render_hook_installed_{};
+    bool weapon_render_hooks_attempted_{};
+    bool weapon_render_hooks_installed_{};
     std::size_t injection_failure_logs_{};
     unsigned int configuration_retry_count_{};
     unsigned int next_configuration_retry_ms_{};
