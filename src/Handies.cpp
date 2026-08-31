@@ -309,6 +309,12 @@ private:
            ped.m_pVehicle->m_pDriver == &ped;
 }
 
+[[nodiscard]] bool has_equipped_weapon(CPed& ped) noexcept {
+    const CWeapon* const weapon{ped.GetWeapon()};
+    return weapon != nullptr &&
+           weapon->m_eWeaponType != WEAPONTYPE_UNARMED;
+}
+
 [[nodiscard]] bool wants_closed_fist(CPed& ped) noexcept {
     if (is_vehicle_driver(ped)) return true;
     if (ped.m_pIntelligence != nullptr) {
@@ -472,6 +478,7 @@ public:
             configured_sequence_logged_ = false;
             native_signal_logged_ = false;
             structural_profile_logged_ = false;
+            weapon_profile_logged_ = false;
             load_settings();
             install_final_render_hook();
             if (profiles_.empty() && !load_runtime_data()) {
@@ -1402,6 +1409,8 @@ private:
     void apply_blendshapes(PedEntry& entry) noexcept {
         const bool driver{entry.ped != nullptr &&
             is_vehicle_driver(*entry.ped)};
+        const bool right_hand_holds_weapon{entry.ped != nullptr && !driver &&
+            has_equipped_weapon(*entry.ped)};
         const bool hand_gestures_allowed{entry.ped != nullptr && !driver};
         const ActiveHandSequence configured_sequence{hand_gestures_allowed
             ? find_active_hand_sequence(*entry.ped)
@@ -1465,6 +1474,14 @@ private:
                 const MorphTarget* const fucku{side == 1
                     ? find_morph_target(morph_template, "FuckU")
                     : nullptr};
+                const MorphTarget* const weapon_pose{side == 1 &&
+                        right_hand_holds_weapon
+                    ? find_morph_target(morph_template, "Weap")
+                    : nullptr};
+                if (weapon_pose != nullptr && !weapon_profile_logged_) {
+                    log("Perfil Weap derecho activo para arma equipada.");
+                    weapon_profile_logged_ = true;
+                }
                 const MorphTarget* sequence_target{};
                 float sequence_blend{};
                 bool configured_side_active{};
@@ -1553,6 +1570,7 @@ private:
                     blend_target(fucku, fucku_blend);
                     blend_target(
                         sequence_target, std::clamp(sequence_blend, 0.0F, 1.0F));
+                    blend_target(weapon_pose, 1.0F);
                     vertices[vertex] = position;
                     if (has_normals) {
                         normalize_vector(normal);
@@ -1631,6 +1649,7 @@ private:
     bool configured_sequence_logged_{};
     bool native_signal_logged_{};
     mutable bool structural_profile_logged_{};
+    bool weapon_profile_logged_{};
 };
 
 HandiesMod handies_mod{};

@@ -35,6 +35,8 @@ The source IFP remains `modloader\hands\ghands.ifp`; Handies does not register a
 
 With no active hand action, the player is rendered from the GLB `Basis` without an additional morph. A ped occupying its vehicle's driver seat uses `Grip` on both hands; driver state takes priority over configurable hand-signal profiles until the ped leaves that seat.
 
+Outside the driver seat, an equipped weapon applies the edited GLB `Weap` target to the right hand as the final hand pose. The target is used only by hand templates that actually provide it; the current edited GLB defines it on `Slim_Right`.
+
 ## Hand sequence profiles
 
 Each `[HandProfile.Name]` section chooses one IFP sequence per side:
@@ -101,7 +103,7 @@ The four source-hand variants and their editable profiles can be exported with B
   --output "C:\path\to\Handies_Blendshape_Profiles.glb"
 ```
 
-The GLB contains `Slim_Left`, `Slim_Right`, `Fat_Left`, and `Fat_Right`. Its basis is the `Relaxed` runtime profile; the morph targets are `Grip`, right-hand `FuckU`, and the five matching `LHGsign` or `RHGsign` profiles sampled from the sustained part of their IFP sequences. `tools\extract_blendshape_profiles.py` accepts ordinary glTF vertex splitting, ignores unrelated scene objects, reconstructs the original source topology, and writes the runtime-ready profiles. UV coordinates and the editable shape keys are preserved.
+The GLB contains `Slim_Left`, `Slim_Right`, `Fat_Left`, and `Fat_Right`. Its basis is the `Relaxed` runtime profile; the morph targets are `Grip`, right-hand `FuckU`, `Slim_Right.Weap`, and the five matching `LHGsign` or `RHGsign` profiles sampled from the sustained part of their IFP sequences. `tools\extract_blendshape_profiles.py` accepts ordinary glTF vertex splitting, ignores unrelated scene objects, reconstructs the original source topology, and writes the runtime-ready profiles. UV coordinates and the editable shape keys are preserved.
 
 ## Manual geometry conversion
 
