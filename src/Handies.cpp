@@ -86,7 +86,7 @@ struct Settings {
 
 struct WeaponAdjustment {
     bool enabled{true};
-    RwV3d position{-0.036242F, 0.002248F, 0.007982F};
+    RwV3d position{};
     RwV3d rotation{};
 };
 
@@ -600,7 +600,7 @@ private:
             ini_path_.data(), "WeaponGrip", "Enabled", "1"), 1) != 0;
         static_cast<void>(parse_vector3(read_ini_string(
             ini_path_.data(), "WeaponGrip", "Position",
-            "-0.036242,0.002248,0.007982"), default_adjustment.position));
+            "0,0,0"), default_adjustment.position));
         static_cast<void>(parse_vector3(read_ini_string(
             ini_path_.data(), "WeaponGrip", "Rotation", "0,0,0"),
             default_adjustment.rotation));
